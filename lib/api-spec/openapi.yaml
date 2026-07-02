@@ -1,22 +1,29 @@
 openapi: 3.1.0
 info:
-  # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: Satellite Tracker API
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: satellites
+    description: Live satellite position data
+  - name: weather
+    description: Space weather data
+  - name: location
+    description: User geolocation
+  - name: history
+    description: Satellite position history
+
 paths:
   /healthz:
     get:
       operationId: healthCheck
       tags: [health]
       summary: Health check
-      description: Returns server health status
       responses:
         "200":
           description: Healthy
@@ -24,6 +31,115 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /satellites/iss:
+    get:
+      operationId: getIssPosition
+      tags: [satellites]
+      summary: Get current ISS position
+      responses:
+        "200":
+          description: ISS position
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SatellitePosition"
+
+  /satellites/css:
+    get:
+      operationId: getCssPosition
+      tags: [satellites]
+      summary: Get current CSS (Tiangong) position
+      responses:
+        "200":
+          description: CSS position
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SatellitePosition"
+
+  /weather/kp:
+    get:
+      operationId: getKpIndex
+      tags: [weather]
+      summary: Get current Kp (geomagnetic) index
+      responses:
+        "200":
+          description: Space weather data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SpaceWeather"
+
+  /location:
+    get:
+      operationId: getUserLocation
+      tags: [location]
+      summary: Get approximate user location from IP
+      responses:
+        "200":
+          description: User location
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserLocation"
+
+  /history:
+    get:
+      operationId: getHistory
+      tags: [history]
+      summary: Get saved position history for both satellites
+      responses:
+        "200":
+          description: History records
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/HistoryRecord"
+    post:
+      operationId: addHistoryRecord
+      tags: [history]
+      summary: Save a position snapshot to history
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HistoryInput"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HistoryRecord"
+
+  /history/{id}:
+    delete:
+      operationId: deleteHistoryRecord
+      tags: [history]
+      summary: Delete a history record
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Deleted
+
+  /history/clear:
+    delete:
+      operationId: clearHistory
+      tags: [history]
+      summary: Clear all history records
+      responses:
+        "204":
+          description: Cleared
+
 components:
   schemas:
     HealthStatus:
@@ -34,3 +150,89 @@ components:
       required:
         - status
 
+    SatellitePosition:
+      type: object
+      required: [id, name, latitude, longitude, altitude, velocity, timestamp, country]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        latitude:
+          type: number
+        longitude:
+          type: number
+        altitude:
+          type: number
+        velocity:
+          type: number
+        timestamp:
+          type: integer
+        country:
+          type: string
+
+    SpaceWeather:
+      type: object
+      required: [kpIndex, status, tecValue, ionoDelayNs]
+      properties:
+        kpIndex:
+          type: number
+        status:
+          type: string
+        tecValue:
+          type: number
+        ionoDelayNs:
+          type: number
+
+    UserLocation:
+      type: object
+      required: [lat, lon, city, country, known]
+      properties:
+        lat:
+          type: number
+        lon:
+          type: number
+        city:
+          type: string
+        country:
+          type: string
+        known:
+          type: boolean
+
+    HistoryRecord:
+      type: object
+      required: [id, satellite, latitude, longitude, country, altitude, timestamp, createdAt]
+      properties:
+        id:
+          type: integer
+        satellite:
+          type: string
+        latitude:
+          type: number
+        longitude:
+          type: number
+        country:
+          type: string
+        altitude:
+          type: number
+        timestamp:
+          type: integer
+        createdAt:
+          type: string
+
+    HistoryInput:
+      type: object
+      required: [satellite, latitude, longitude, country, altitude, timestamp]
+      properties:
+        satellite:
+          type: string
+        latitude:
+          type: number
+        longitude:
+          type: number
+        country:
+          type: string
+        altitude:
+          type: number
+        timestamp:
+          type: integer

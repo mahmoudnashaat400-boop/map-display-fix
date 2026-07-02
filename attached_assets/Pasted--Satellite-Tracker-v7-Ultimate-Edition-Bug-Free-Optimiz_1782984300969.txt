@@ -1,0 +1,1357 @@
+/*
+ * Satellite Tracker v7 — Ultimate Edition (Bug-Free & Optimized)
+ * =====================================================================
+ */
+
+#include <Arduino.h>
+#include <WiFiManager.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <lvgl.h>
+#include <TFT_eSPI.h>
+#include <XPT2046_Touchscreen.h>
+#include <math.h>
+#include <ArduinoJson.h>
+#include <RTClib.h>
+#include <esp32-hal-ledc.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+#include <esp_task_wdt.h>
+
+/////////////////////////////////////////
+/// User Preferences
+/////////////////////////////////////////
+#define POSITION_UPDATE_TIME   10000UL
+#define FACT_FADE_UPDATE_TIME  58UL
+#define BRIGHTNESS_UPDATE_TIME 10000UL
+#define MAX_TRACK_DOTS         50
+#define SCREEN_MINIMUM_BRIGHTNESS 10
+
+#define PREDICT_COUNT    6
+#define PREDICT_STEP_SEC 600
+
+#define PRED_DOT_UPDATE_MS 600000UL
+#define TRACK_DOT_FADE_MS  1800000UL
+
+#define TOUCH_RELEASE_DEBOUNCE 2
+
+#define N2YO_API_KEY   "JYRTWC-7FBHWL-5PBWKR-5S9Y"
+#define CSS_NORAD_ID   "48274"
+#define MAX_PASSES_SHOWN 5
+/////////////////////////////////////////
+
+#define SCREEN_WIDTH  320
+#define SCREEN_HEIGHT 240
+
+#define XPT2046_IRQ   36
+#define XPT2046_MOSI  32
+#define XPT2046_MISO  39
+#define XPT2046_CLK   25
+#define XPT2046_CS    33
+#define LCD_BACKLIGHT_PIN 21
+
+#define DEFAULT_CAPTIVE_SSID "SpaceStationTracker"
+#define DRAW_BUF_SIZE (SCREEN_WIDTH * SCREEN_HEIGHT / 10 * (LV_COLOR_DEPTH / 8))
+
+// =====================================================================
+// Hardware
+// =====================================================================
+SPIClass touchscreenSPI = SPIClass(VSPI);
+XPT2046_Touchscreen touchscreen(XPT2046_CS, XPT2046_IRQ);
+const int freq       = 5000;
+const int ledChannel = 0;
+const int resolution = 8;
+int brightness = 255;
+
+uint32_t draw_buf[DRAW_BUF_SIZE / 4];
+int x, y, z;
+int touch_release_counter = 0;
+
+// =====================================================================
+// HTTP Mutex & Flags
+// =====================================================================
+SemaphoreHandle_t g_http_mutex = NULL;
+volatile bool g_cancel_overpass = false;
+
+// =====================================================================
+// ISS Variables
+// =====================================================================
+float latitude = 0.0f, longitude = 0.0f;
+float prev_latitude = 0.0f, prev_longitude = 0.0f;
+unsigned long prev_unix_time = 0;
+bool have_prev_sample = false;
+String country_name = "Searching...";
+int x_pixel = 0, y_pixel = 0;
+int track_counter = 5;
+
+// =====================================================================
+// CSS (Tiangong) Variables
+// =====================================================================
+float css_latitude = 0.0f, css_longitude = 0.0f;
+float css_prev_latitude = 0.0f, css_prev_longitude = 0.0f;
+unsigned long css_prev_unix_time = 0;
+bool have_css_prev_sample = false;
+String css_country_name = "Searching...";
+int css_x_pixel = 0, css_y_pixel = 0;
+int css_track_counter = 5;
+
+float map_width  = 320.0f;
+float map_height = 240.0f;
+unsigned long unix_time = 0;
+
+// =====================================================================
+// Staged variables
+// =====================================================================
+float staged_latitude  = 0.0f, staged_longitude  = 0.0f;
+char  staged_country_name[64] = "Searching...";
+float staged_css_latitude = 0.0f, staged_css_longitude = 0.0f;
+char  staged_css_country_name[64] = "Searching...";
+unsigned long staged_unix_time = 0;
+unsigned long staged_css_unix_time = 0;
+
+TaskHandle_t  issTaskHandle  = NULL;
+volatile bool iss_data_ready = false;
+
+// =====================================================================
+// Device location
+// =====================================================================
+float device_lat      = 0.0f;
+float device_lon      = 0.0f;
+char  device_city[64] = "";
+bool  device_loc_known = false;
+volatile bool overpass_fetch_done = false;
+TaskHandle_t  overpassTaskHandle  = NULL;
+char          overpass_result[1200] = "Tap the UTC time to view pass times.";
+
+// =====================================================================
+// Image declarations & LVGL objects
+// =====================================================================
+LV_IMAGE_DECLARE(iss_icon_trans60x60);
+LV_IMAGE_DECLARE(bluemarble_320x240);
+
+lv_obj_t * img1;
+lv_obj_t * img_css;
+lv_obj_t * lat_label, * lon_label;
+lv_obj_t * css_lat_label, * css_lon_label;
+lv_obj_t * time_label;
+lv_obj_t * country_label;
+lv_obj_t * css_country_label;
+lv_obj_t * fact_label;
+
+lv_opa_t fact_opacity = 0;
+
+const char* iss_facts[] = {
+  "The ISS orbits Earth about every\n90 minutes.",
+  "The average altitude of the ISS\nis 250 miles.",
+  "The speed of the ISS is 17,000 mph!",
+  "The ISS orbits Earth over 15\ntimes per day."
+};
+
+const char* css_facts[] = {
+  "Tiangong (CSS) means\n'Heavenly Palace'.",
+  "It is China's first long-term\nspace station.",
+  "Orbiting at around 340-450 km\nabove Earth.",
+  "It was fully assembled in\nlate 2022."
+};
+
+lv_obj_t * track_dots[MAX_TRACK_DOTS];
+lv_obj_t * css_track_dots[MAX_TRACK_DOTS];
+int track_dot_counter     = 0;
+int css_track_dot_counter = 0;
+unsigned long track_dot_place_time[MAX_TRACK_DOTS];
+unsigned long css_track_dot_place_time[MAX_TRACK_DOTS];
+
+lv_obj_t * iss_pred_dots[PREDICT_COUNT];
+lv_obj_t * css_pred_dots[PREDICT_COUNT];
+uint8_t    iss_pred_opa[PREDICT_COUNT];
+uint8_t    css_pred_opa[PREDICT_COUNT];
+
+const uint8_t PRED_SETTLED_OPA[PREDICT_COUNT] = {230, 200, 170, 145, 120, 100};
+struct PredictedPoint { float lat, lon; unsigned long t; };
+
+// تُعرَّف هنا فوق (مش جنب الدوال اللي تستخدمها) لأن Arduino IDE بيحط
+// auto-generated function prototypes فوق الملف قبل أي struct تتعرف لاحقاً،
+// فلو الـstruct متعرفة تحت، الـprototype هيفشل بـ "has not been declared".
+struct LocalPass {
+  unsigned long rise_utc;
+  unsigned long peak_utc;
+  float         max_el_deg;
+  int           duration_min;
+};
+
+PredictedPoint staged_iss_pred[PREDICT_COUNT];
+PredictedPoint staged_css_pred[PREDICT_COUNT];
+volatile bool  pred_dots_data_ready = false;
+volatile uint8_t pred_fade_state = 0;
+
+char iss_pred_country_cache[PREDICT_COUNT][48];
+char css_pred_country_cache[PREDICT_COUNT][48];
+volatile bool iss_pred_country_ready = false;
+volatile bool css_pred_country_ready = false;
+
+lv_obj_t * predict_panel;
+lv_obj_t * predict_label;
+lv_obj_t * overpass_panel;
+lv_obj_t * ov_scroll_area;
+lv_obj_t * overpass_label;
+
+uint8_t  g_sat_filter  = 0;
+lv_obj_t * filter_btn  = NULL;
+lv_obj_t * filter_menu = NULL;
+bool filter_menu_open   = false;
+
+// =====================================================================
+// Telecom constants & Space Weather
+// =====================================================================
+#define ISS_FREQ_MHZ   145.800f
+#define CSS_FREQ_MHZ   437.525f
+#define ISS_ALT_KM     408.0f
+#define CSS_ALT_KM     390.0f
+#define EARTH_R_KM     6371.0f
+#define SPEED_OF_LIGHT 299792.458f
+
+float g_iss_doppler_hz = 0.0f, g_css_doppler_hz = 0.0f;
+float g_iss_range_km = 0.0f, g_css_range_km = 0.0f;
+float g_iss_fspl_db = 0.0f, g_css_fspl_db = 0.0f;
+float g_iss_elevation = 0.0f, g_css_elevation = 0.0f;
+
+#define KP_FETCH_INTERVAL_CYCLES 1080
+uint16_t g_kp_fetch_counter = 0;
+float    g_kp_index         = 2.0f;
+char     g_space_weather_status[16] = "QUIET";
+float    g_tec_value     = 0.0f;
+float    g_iono_delay_ns = 0.0f;
+
+float g_iss_azimuth = 0.0f, g_css_azimuth = 0.0f;
+float g_iss_prev_elev = -999.0f, g_css_prev_elev = -999.0f;
+char  g_iss_pass_state[16] = "N/A", g_css_pass_state[16] = "N/A";
+
+lv_obj_t * g_iss_compass_ring = NULL, * g_iss_compass_needle = NULL;
+lv_obj_t * g_iss_needle_head = NULL, * g_iss_ant_label = NULL, * g_iss_tx_label = NULL;
+lv_obj_t * g_css_compass_ring = NULL, * g_css_compass_needle = NULL;
+lv_obj_t * g_css_needle_head = NULL, * g_css_ant_label = NULL, * g_css_tx_label = NULL;
+lv_obj_t * telecom_panel = NULL, * telecom_label = NULL, * telecom_btn = NULL;
+
+static lv_point_precise_t g_iss_needle_pts[2];
+static lv_point_precise_t g_css_needle_pts[2];
+
+// =====================================================================
+// Helper math
+// =====================================================================
+float degrees_to_radians(float d) { return d * PI / 180.0f; }
+
+float calc_local_solar_hour(int utc_hour, float lon_deg) {
+  float h = (float)utc_hour + (lon_deg / 15.0f);
+  while (h <  0.0f)  h += 24.0f;
+  while (h >= 24.0f) h -= 24.0f;
+  return h;
+}
+
+float calculate_mercator_x(float lon_deg, float w) { return (lon_deg + 180.0f) * (w / 360.0f); }
+float calculate_mercator_y(float lat_deg, float h, float w) {
+  float r = degrees_to_radians(lat_deg);
+  float n = log(tan(PI / 4.0f + r / 2.0f));
+  return (h / 2.0f) - (w * n / (2.0f * PI));
+}
+
+void lat_lon_to_pixel() {
+  x_pixel     = (int)calculate_mercator_x(longitude,     map_width);
+  y_pixel     = (int)calculate_mercator_y(latitude,      map_height, map_width);
+  css_x_pixel = (int)calculate_mercator_x(css_longitude, map_width);
+  css_y_pixel = (int)calculate_mercator_y(css_latitude,  map_height, map_width);
+}
+
+void log_print(lv_log_level_t level, const char * buf) { Serial.println(buf); }
+
+// =====================================================================
+// Local Geocoder
+// =====================================================================
+String guess_location_name(float lat, float lon) {
+  if (lat >  70.0f) return "Arctic Ocean";
+  if (lat < -60.0f) return "Southern Ocean";
+  if (lat>54&&lat<73  &&lon>-168&&lon<-130) return "Alaska, USA";
+  if (lat>24&&lat<49.5&&lon>-125&&lon<-66)  return "United States";
+  if (lat>42&&lat<84  &&lon>-141&&lon<-52)  return "Canada";
+  if (lat>14&&lat<33  &&lon>-118&&lon<-86)  return "Mexico";
+  if (lat>7 &&lat<18  &&lon>-92 &&lon<-77)  return "Central America";
+  if (lat>17&&lat<23.5&&lon>-85 &&lon<-74)  return "Cuba";
+  if (lat>17&&lat<21.5&&lon>-161.5&&lon<-154.5) return "Hawaii, USA";
+  if (lat>-4 &&lat<8  &&lon>-77&&lon<-67)   return "Colombia";
+  if (lat>-5 &&lat<1  &&lon>-82&&lon<-75)   return "Ecuador";
+  if (lat>-18&&lat<-3 &&lon>-81&&lon<-68)   return "Peru";
+  if (lat>-23&&lat<-9 &&lon>-74&&lon<-57)   return "Bolivia";
+  if (lat>-5 &&lat<13 &&lon>-73&&lon<-59)   return "Venezuela";
+  if (lat>-34&&lat<5  &&lon>-74&&lon<-34)   return "Brazil";
+  if (lat>-56&&lat<-21&&lon>-73&&lon<-52)   return "Argentina";
+  if (lat>-56&&lat<-17&&lon>-75&&lon<-66)   return "Chile";
+  if (lat>-35&&lat<-21&&lon>-58&&lon<-53)   return "Uruguay";
+  if (lat>-23&&lat<-19&&lon>-58&&lon<-57)   return "Paraguay";
+  if (lat>63&&lat<67  &&lon>-25&&lon<-13)   return "Iceland";
+  if (lat>51&&lat<55.5&&lon>-10&&lon<-6)    return "Ireland";
+  if (lat>49.5&&lat<61&&lon>-8 &&lon<2)     return "United Kingdom";
+  if (lat>36&&lat<44  &&lon>-9.5&&lon<-6)   return "Portugal";
+  if (lat>36&&lat<44  &&lon>-9 &&lon<4.5)   return "Spain";
+  if (lat>41&&lat<51.5&&lon>-5.5&&lon<9.6)  return "France";
+  if (lat>47&&lat<55.5&&lon>5.5&&lon<15.5)  return "Germany";
+  if (lat>51&&lat<54  &&lon>3  &&lon<7.5)   return "Netherlands";
+  if (lat>49.5&&lat<51.5&&lon>2.5&&lon<6.5) return "Belgium";
+  if (lat>45.5&&lat<48&&lon>6  &&lon<11)    return "Switzerland";
+  if (lat>46.5&&lat<49&&lon>9.5&&lon<17.5)  return "Austria";
+  if (lat>49&&lat<51.5&&lon>12.5&&lon<18.5) return "Czech Republic";
+  if (lat>47.5&&lat<49&&lon>16.5&&lon<22.5) return "Slovakia";
+  if (lat>45.5&&lat<49&&lon>16 &&lon<23)    return "Hungary";
+  if (lat>49.5&&lat<55&&lon>14 &&lon<24.5)  return "Poland";
+  if (lat>53.5&&lat<57&&lon>20.5&&lon<26.5) return "Lithuania";
+  if (lat>55.5&&lat<58&&lon>20.5&&lon<28.5) return "Latvia";
+  if (lat>57.5&&lat<60&&lon>20.5&&lon<28.5) return "Estonia";
+  if (lat>59.5&&lat<70.5&&lon>20&&lon<32)   return "Finland";
+  if (lat>55&&lat<69.5&&lon>11&&lon<28.5)   return "Sweden";
+  if (lat>57&&lat<72  &&lon>4.5&&lon<32)    return "Norway";
+  if (lat>54.5&&lat<57.5&&lon>8&&lon<15.5)  return "Denmark";
+  if (lat>35.5&&lat<42&&lon>19.5&&lon<29.5) return "Greece";
+  if (lat>37.5&&lat<47.5&&lon>6.5&&lon<18.5)return "Italy";
+  if (lat>41.5&&lat<44.5&&lon>19&&lon<22)   return "Albania";
+  if (lat>43&&lat<47  &&lon>13 &&lon<21)    return "Croatia/Bosnia";
+  if (lat>42&&lat<46  &&lon>20 &&lon<23.5)  return "Serbia";
+  if (lat>44&&lat<47  &&lon>20 &&lon<30.5)  return "Romania";
+  if (lat>41&&lat<44.5&&lon>22.5&&lon<28.5) return "Bulgaria";
+  if (lat>44&&lat<52.5&&lon>22&&lon<40.5)   return "Ukraine";
+  if (lat>51&&lat<54  &&lon>23 &&lon<33)    return "Belarus";
+  if (lat>36&&lat<42.5&&lon>26&&lon<45)     return "Turkey";
+  if (lat>41&&lat<43.5&&lon>40&&lon<47)     return "Georgia";
+  if (lat>38.5&&lat<41.5&&lon>43.5&&lon<47) return "Armenia";
+  if (lat>38&&lat<42  &&lon>44.5&&lon<51)   return "Azerbaijan";
+  if (lat>36.5&&lat<42.5&&lon>52&&lon<66)   return "Turkmenistan";
+  if (lat>37&&lat<46  &&lon>55.5&&lon<74.5) return "Uzbekistan";
+  if (lat>37&&lat<41.5&&lon>67.5&&lon<75.5) return "Tajikistan";
+  if (lat>39&&lat<43.5&&lon>69.5&&lon<81)   return "Kyrgyzstan";
+  if (lat>40&&lat<55  &&lon>51 &&lon<87.5)  return "Kazakhstan";
+  if (lat>29.5&&lat<38.5&&lon>61&&lon<75)   return "Afghanistan";
+  if (lat>54&&lat<82  &&lon>19 &&lon<180)   return "Russia";
+  if (lat>41&&lat<56  &&lon>40 &&lon<62)    return "Russia";
+  if (lat>24&&lat<37.5&&lon>44&&lon<64.5)   return "Iran";
+  if (lat>29&&lat<38  &&lon>38.5&&lon<49)   return "Iraq";
+  if (lat>32&&lat<37  &&lon>35.5&&lon<42.5) return "Syria";
+  if (lat>33&&lat<34.5&&lon>35&&lon<36.5)   return "Lebanon";
+  if (lat>29&&lat<33.5&&lon>34&&lon<36)     return "Israel";
+  if (lat>29&&lat<33.5&&lon>35&&lon<39.5)   return "Jordan";
+  if (lat>20&&lat<32.5&&lon>36&&lon<56)     return "Saudi Arabia";
+  if (lat>22&&lat<26.5&&lon>51&&lon<56.5)   return "UAE";
+  if (lat>22&&lat<24.5&&lon>50.5&&lon<51.5) return "Qatar";
+  if (lat>17&&lat<30.5&&lon>51.5&&lon<60.5) return "Oman";
+  if (lat>12&&lat<19  &&lon>41.5&&lon<55)   return "Yemen";
+  if (lat>28&&lat<30.5&&lon>46.5&&lon<48.5) return "Kuwait";
+  if (lat>20&&lat<38  &&lon>60&&lon<77.5)   return "Pakistan";
+  if (lat>7 &&lat<37.5&&lon>67&&lon<97.5)   return "India";
+  if (lat>5.5&&lat<10 &&lon>79.5&&lon<82)   return "Sri Lanka";
+  if (lat>26&&lat<30.5&&lon>80&&lon<88.5)   return "Nepal";
+  if (lat>26.5&&lat<28.5&&lon>88.5&&lon<92.5)return "Bhutan";
+  if (lat>20.5&&lat<26.5&&lon>88&&lon<93.5) return "Bangladesh";
+  if (lat>17.5&&lat<53.5&&lon>73&&lon<135.5)return "China";
+  if (lat>38.5&&lat<43 &&lon>124&&lon<131.5)return "North Korea";
+  if (lat>33  &&lat<38.5&&lon>124&&lon<130.5)return "South Korea";
+  if (lat>30  &&lat<46  &&lon>130&&lon<146)  return "Japan";
+  if (lat>22  &&lat<26  &&lon>120&&lon<122)  return "Taiwan";
+  if (lat>16.5&&lat<28.5&&lon>92.5&&lon<101.5)return "Myanmar";
+  if (lat>5.5 &&lat<22  &&lon>97.5&&lon<106.5)return "Thailand";
+  if (lat>13.5&&lat<22.5&&lon>100&&lon<107.5)return "Laos";
+  if (lat>8.5 &&lat<23.5&&lon>102&&lon<110)  return "Vietnam";
+  if (lat>10  &&lat<15  &&lon>102.5&&lon<107.5)return "Cambodia";
+  if (lat>1   &&lat<7.5 &&lon>99.5&&lon<119.5)return "Malaysia";
+  if (lat>4.5 &&lat<21  &&lon>116.5&&lon<127) return "Philippines";
+  if (lat>-8  &&lat<6.5 &&lon>95  &&lon<141.5)return "Indonesia";
+  if (lat>21.5&&lat<31.5&&lon>24.5&&lon<37.5)return "Egypt";
+  if (lat>30  &&lat<37.5&&lon>-2  &&lon<12)  return "Algeria";
+  if (lat>27.5&&lat<36.5&&lon>-6.5&&lon<0)   return "Morocco";
+  if (lat>29.5&&lat<33.5&&lon>7.5 &&lon<12.5)return "Tunisia";
+  if (lat>19  &&lat<33.5&&lon>9.5 &&lon<25.5)return "Libya";
+  if (lat>14.5&&lat<23.5&&lon>11.5&&lon<24.5)return "Niger";
+  if (lat>11.5&&lat<23.5&&lon>13.5&&lon<24.5)return "Chad";
+  if (lat>4   &&lat<14.5&&lon>-6  &&lon<2.5) return "Ivory Coast";
+  if (lat>4.5 &&lat<14.5&&lon>2.5 &&lon<15)  return "Nigeria";
+  if (lat>3   &&lat<13  &&lon>8.5 &&lon<16.5)return "Cameroon";
+  if (lat>-4.5&&lat<3.5 &&lon>8.5 &&lon<18.5)return "Congo";
+  if (lat>-14 &&lat<-4.5&&lon>11.5&&lon<31.5)return "Angola / DRC";
+  if (lat>-5.5&&lat<5   &&lon>29.5&&lon<36.5)return "Uganda / Rwanda";
+  if (lat>-5  &&lat<5.5 &&lon>33.5&&lon<42)  return "Kenya";
+  if (lat>4.5 &&lat<15.5&&lon>33.5&&lon<42)  return "Ethiopia";
+  if (lat>2.5 &&lat<12.5&&lon>41.5&&lon<51.5)return "Somalia";
+  if (lat>-13.5&&lat<-5 &&lon>33  &&lon<41.5)return "Tanzania";
+  if (lat>-22.5&&lat<-15&&lon>25.5&&lon<33.5)return "Zimbabwe";
+  if (lat>-30.5&&lat<-17.5&&lon>20&&lon<27.5)return "Botswana";
+  if (lat>-29 &&lat<-17&&lon>11.5 &&lon<25)  return "Namibia";
+  if (lat>-35.5&&lat<-22&&lon>16.5&&lon<33.5)return "South Africa";
+  if (lat>-26.5&&lat<-12&&lon>43  &&lon<51.5)return "Madagascar";
+  if (lat>14.5&&lat<23.5&&lon>-3.5&&lon<4.5) return "Mali";
+  if (lat>11.5&&lat<15.5&&lon>-17.5&&lon<-13.5)return "Senegal";
+  if (lat>9   &&lat<15.5&&lon>-15.5&&lon<-11.5)return "Guinea";
+  if (lat>0   &&lat<15.5&&lon>24.5 &&lon<37.5) return "Sudan";
+  if (lat>-44.5&&lat<-10.5&&lon>113&&lon<154) return "Australia";
+  if (lat>-47.5&&lat<-34  &&lon>166&&lon<178.5)return "New Zealand";
+  if (lat >  66.5f) return "Arctic Ocean";
+  if (lat < -60.0f) return "Southern Ocean";
+  if (lon >= -70.0f && lon <  20.0f) return "Atlantic Ocean";
+  if (lon >=  20.0f && lon < 147.0f) return "Indian Ocean";
+  return "Pacific Ocean";
+}
+
+// =====================================================================
+// Geo Cache
+// =====================================================================
+struct GeoCache { float lat; float lon; char name[48]; };
+static GeoCache s_geo_cache[8];
+static int s_cache_len = 0;
+static int s_cache_idx = 0;
+
+String get_country_name_from_coords(float lat, float lon, uint32_t mutex_timeout_ms = 6000) {
+  if (isnan(lat) || isnan(lon) || fabsf(lat) > 90.0f || fabsf(lon) > 180.0f
+      || (lat == 0.0f && lon == 0.0f)) {
+    return "Searching...";
+  }
+  for (int i = 0; i < s_cache_len; i++) {
+    if (fabsf(s_geo_cache[i].lat - lat) < 0.8f &&
+        fabsf(s_geo_cache[i].lon - lon) < 0.8f) {
+      return String(s_geo_cache[i].name);
+    }
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    return guess_location_name(lat, lon);
+  }
+  bool api_ran  = false;
+  String result = "";
+  if (xSemaphoreTake(g_http_mutex, pdMS_TO_TICKS(mutex_timeout_ms)) == pdTRUE) {
+    WiFiClient plain_client;
+    plain_client.setTimeout(5000);
+    HTTPClient http;
+    http.setTimeout(5000);
+    http.addHeader("User-Agent", "ESP32-SatTracker/1.0");
+    String url = "http://api.bigdatacloud.net/data/reverse-geocode-client?latitude="
+                 + String(lat, 4) + "&longitude=" + String(lon, 4)
+                 + "&localityLanguage=en";
+    if (http.begin(plain_client, url)) {
+      int code = http.GET();
+      if (code == 200) {
+        StaticJsonDocument<512> doc;
+        if (deserializeJson(doc, http.getStream()) == DeserializationError::Ok) {
+          api_ran = true;
+          const char* country = doc["countryName"] | "";
+          if (strlen(country) > 0 && strcmp(country, "null") != 0) {
+            result = String(country);
+          } else {
+            result = guess_location_name(lat, lon);
+          }
+        }
+      }
+      http.end();
+    }
+    xSemaphoreGive(g_http_mutex);
+  }
+  if (!api_ran || result.length() == 0) {
+    result = guess_location_name(lat, lon);
+  }
+  s_geo_cache[s_cache_idx].lat = lat;
+  s_geo_cache[s_cache_idx].lon = lon;
+  strncpy(s_geo_cache[s_cache_idx].name, result.c_str(), 47);
+  s_geo_cache[s_cache_idx].name[47] = '\0';
+  s_cache_idx = (s_cache_idx + 1) % 8;
+  if (s_cache_len < 8) s_cache_len++;
+  return result;
+}
+
+// =====================================================================
+// Fetch Kp index (NOAA)
+// =====================================================================
+void fetch_kp_index() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (xSemaphoreTake(g_http_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+    WiFiClientSecure client;
+    client.setInsecure(); client.setTimeout(4000);
+    HTTPClient http; http.setTimeout(4000);
+    if (http.begin(client, "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json")) {
+      int code = http.GET();
+      if (code == HTTP_CODE_OK) {
+        String payload = http.getString();
+        DynamicJsonDocument doc(4096);
+        if (!deserializeJson(doc, payload) && doc.is<JsonArray>() && doc.size() > 1) {
+          JsonArray last = doc[doc.size() - 1];
+          if (last.size() >= 2) {
+            float kp = last[1].as<String>().toFloat();
+            g_kp_index = kp;
+            if      (kp < 4.0f) strcpy(g_space_weather_status, "QUIET");
+            else if (kp < 6.0f) strcpy(g_space_weather_status, "MODERATE");
+            else                strcpy(g_space_weather_status, "STORM!");
+          }
+        }
+      }
+      http.end();
+    }
+    xSemaphoreGive(g_http_mutex);
+  }
+}
+
+void update_ionospheric_delay() {
+  DateTime dt(unix_time);
+  float solar_hour = device_loc_known ? calc_local_solar_hour(dt.hour(), device_lon) : (float)dt.hour();
+  float base_tec = 5.0f;
+  if (solar_hour >= 8.0f && solar_hour <= 18.0f)
+    base_tec = 25.0f - fabsf(13.0f - solar_hour) * 2.0f;
+  g_tec_value = base_tec + (g_kp_index * 1.5f);
+  double tec_total    = (double)g_tec_value * 1e16;
+  double freq_hz      = (double)ISS_FREQ_MHZ * 1e6;
+  double path_delay_m = (40.3 * tec_total) / (freq_hz * freq_hz);
+  double c_m_per_s    = (double)SPEED_OF_LIGHT * 1000.0;
+  g_iono_delay_ns     = (float)((path_delay_m / c_m_per_s) * 1e9);
+}
+
+// =====================================================================
+// Antenna Pointing & Telecom Math
+// =====================================================================
+float calc_central_angle_rad(float obs_lat, float obs_lon, float sat_lat, float sat_lon) {
+  float dlat = degrees_to_radians(sat_lat - obs_lat);
+  float dlon = degrees_to_radians(sat_lon - obs_lon);
+  float a = sinf(dlat/2)*sinf(dlat/2) + cosf(degrees_to_radians(obs_lat))*cosf(degrees_to_radians(sat_lat))*sinf(dlon/2)*sinf(dlon/2);
+  return 2.0f * atan2f(sqrtf(a), sqrtf(1.0f - a));
+}
+
+float calc_range_km(float obs_lat, float obs_lon, float sat_lat, float sat_lon, float alt_km) {
+  float ca = calc_central_angle_rad(obs_lat, obs_lon, sat_lat, sat_lon);
+  float Re = EARTH_R_KM, h = alt_km;
+  return sqrtf(Re*Re + (Re+h)*(Re+h) - 2.0f*Re*(Re+h)*cosf(ca));
+}
+
+float calc_elevation_deg(float obs_lat, float obs_lon, float sat_lat, float sat_lon, float alt_km) {
+  float ca = calc_central_angle_rad(obs_lat, obs_lon, sat_lat, sat_lon);
+  float Re = EARTH_R_KM, h = alt_km;
+  return atan2f(cosf(ca) - Re/(Re+h), sinf(ca)) * 180.0f / PI;
+}
+
+float calc_azimuth_deg(float obs_lat, float obs_lon, float sat_lat, float sat_lon) {
+  float phi1 = degrees_to_radians(obs_lat);
+  float phi2 = degrees_to_radians(sat_lat);
+  float dl   = degrees_to_radians(sat_lon - obs_lon);
+  float y = sinf(dl) * cosf(phi2);
+  float x = cosf(phi1) * sinf(phi2) - sinf(phi1) * cosf(phi2) * cosf(dl);
+  float az = atan2f(y, x) * 180.0f / PI;
+  return fmodf(az + 360.0f, 360.0f);
+}
+
+const char* az_to_cardinal(float az) {
+  static const char* const cards[8] = {"N","NE","E","SE","S","SW","W","NW"};
+  return cards[(int)((az + 22.5f) / 45.0f) % 8];
+}
+
+void update_pass_state(float cur_el, float prev_el, char* buf, size_t sz) {
+  const char* s;
+  if      (cur_el < 0.0f)            s = "NO SIGNAL";
+  else if (cur_el > prev_el + 0.05f) s = "RISING";
+  else if (cur_el < prev_el - 0.05f) s = "SETTING";
+  else                               s = "PEAK";
+  strncpy(buf, s, sz - 1); buf[sz - 1] = '\0';
+}
+
+void update_compass_needle_pos(lv_obj_t* ring, lv_obj_t* needle, lv_obj_t* head, lv_point_precise_t* pts, float az, float el, bool is_iss) {
+  if (!ring || !needle) return;
+
+  // مركز البوصلة بالضبط (الحلقة مقاسها 80x80 فمركزها 40,40 — ده الطرف الثابت)
+  const float CX = 40.0f, CY = 40.0f;
+  const float R  = 32.0f;   // طول السهم من المركز لحد قرب حافة الحلقة
+
+  if (el < 0.0f) {
+    lv_obj_set_style_border_opa(ring, LV_OPA_30, 0);
+    lv_obj_add_flag(needle, LV_OBJ_FLAG_HIDDEN);
+    if (head) lv_obj_add_flag(head, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_obj_set_style_border_opa(ring, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(needle, LV_OBJ_FLAG_HIDDEN);
+
+    // نطرح 90 درجة عشان زاوية صفر (شمال) تتجه لفوق على الشاشة
+    float screen_rad = degrees_to_radians(az - 90.0f);
+    float ex = CX + R * cosf(screen_rad);
+    float ey = CY + R * sinf(screen_rad);
+
+    // الطرف الثابت = مركز البوصلة بالضبط (نفس مكان النقطة البيضاء)
+    // الطرف المتحرك = اتجاه القمر الصناعي الحالي
+    pts[0].x = (lv_value_precise_t)CX;
+    pts[0].y = (lv_value_precise_t)CY;
+    pts[1].x = (lv_value_precise_t)ex;
+    pts[1].y = (lv_value_precise_t)ey;
+    lv_line_set_points(needle, pts, 2);
+
+    if (head) {
+      lv_obj_clear_flag(head, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_set_pos(head, (int)ex - 5, (int)ey - 6);
+    }
+  }
+}
+
+void apply_sat_filter() {
+  bool show_iss = (g_sat_filter == 0 || g_sat_filter == 1);
+  bool show_css = (g_sat_filter == 0 || g_sat_filter == 2);
+  if (show_iss) { lv_obj_clear_flag(img1, LV_OBJ_FLAG_HIDDEN); lv_obj_clear_flag(lat_label, LV_OBJ_FLAG_HIDDEN); lv_obj_clear_flag(lon_label, LV_OBJ_FLAG_HIDDEN); lv_obj_clear_flag(country_label, LV_OBJ_FLAG_HIDDEN); }
+  else { lv_obj_add_flag(img1, LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(lat_label, LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(lon_label, LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(country_label, LV_OBJ_FLAG_HIDDEN); }
+  if (show_css) { lv_obj_clear_flag(img_css, LV_OBJ_FLAG_HIDDEN); lv_obj_clear_flag(css_lat_label, LV_OBJ_FLAG_HIDDEN); lv_obj_clear_flag(css_lon_label, LV_OBJ_FLAG_HIDDEN); lv_obj_clear_flag(css_country_label, LV_OBJ_FLAG_HIDDEN); }
+  else { lv_obj_add_flag(img_css, LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(css_lat_label, LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(css_lon_label, LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(css_country_label, LV_OBJ_FLAG_HIDDEN); }
+  for (int i = 0; i < MAX_TRACK_DOTS; i++) {
+    if (!show_iss) lv_obj_add_flag(track_dots[i], LV_OBJ_FLAG_HIDDEN);
+    else if (track_dot_place_time[i] != 0 && millis() - track_dot_place_time[i] < TRACK_DOT_FADE_MS) lv_obj_clear_flag(track_dots[i], LV_OBJ_FLAG_HIDDEN);
+    if (!show_css) lv_obj_add_flag(css_track_dots[i], LV_OBJ_FLAG_HIDDEN);
+    else if (css_track_dot_place_time[i] != 0 && millis() - css_track_dot_place_time[i] < TRACK_DOT_FADE_MS) lv_obj_clear_flag(css_track_dots[i], LV_OBJ_FLAG_HIDDEN);
+  }
+  for (int i = 0; i < PREDICT_COUNT; i++) {
+    if (!show_iss) lv_obj_add_flag(iss_pred_dots[i], LV_OBJ_FLAG_HIDDEN);
+    else if (iss_pred_opa[i] > 0) lv_obj_clear_flag(iss_pred_dots[i], LV_OBJ_FLAG_HIDDEN);
+    if (!show_css) lv_obj_add_flag(css_pred_dots[i], LV_OBJ_FLAG_HIDDEN);
+    else if (css_pred_opa[i] > 0) lv_obj_clear_flag(css_pred_dots[i], LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+void filter_menu_close() { lv_obj_add_flag(filter_menu, LV_OBJ_FLAG_HIDDEN); filter_menu_open = false; }
+void filter_iss_cb(lv_event_t * e)  { g_sat_filter = 1; apply_sat_filter(); filter_menu_close(); }
+void filter_css_cb(lv_event_t * e)  { g_sat_filter = 2; apply_sat_filter(); filter_menu_close(); }
+void filter_both_cb(lv_event_t * e) { g_sat_filter = 0; apply_sat_filter(); filter_menu_close(); }
+
+void filter_btn_cb(lv_event_t * e) {
+  if (filter_menu_open) { filter_menu_close(); }
+  else {
+    lv_obj_add_flag(predict_panel,  LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(overpass_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(telecom_panel,  LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(filter_menu, LV_OBJ_FLAG_HIDDEN);
+    filter_menu_open = true;
+  }
+}
+
+float calc_doppler_hz(float freq_mhz, float range_now_km, float range_prev_km, float dt_sec) {
+  if (dt_sec <= 0) return 0.0f;
+  float v_radial = (range_now_km - range_prev_km) / dt_sec;
+  return -freq_mhz * 1e6f * v_radial / SPEED_OF_LIGHT;
+}
+
+float calc_fspl_db(float range_km, float freq_mhz) {
+  if (range_km <= 0) return 0.0f;
+  return 32.44f + 20.0f*log10f(freq_mhz) + 20.0f*log10f(range_km);
+}
+
+const char* signal_quality(float fspl_db) {
+  if (fspl_db < 135.0f) return "EXCELLENT";
+  if (fspl_db < 140.0f) return "GOOD";
+  if (fspl_db < 145.0f) return "FAIR";
+  return "WEAK";
+}
+
+const char* signal_bars(float fspl_db) {
+  if (fspl_db < 135.0f) return "||||||||";
+  if (fspl_db < 138.0f) return "||||||..";
+  if (fspl_db < 141.0f) return "||||....";
+  if (fspl_db < 144.0f) return "||......";
+  return "|.......";
+}
+
+void update_telecom_values() {
+  if (!device_loc_known || !have_prev_sample) return;
+  update_ionospheric_delay();
+  float dt = (float)((long)unix_time - (long)prev_unix_time);
+  if (dt <= 0.0f) return;
+  float iss_range_prev = calc_range_km(device_lat, device_lon, prev_latitude, prev_longitude, ISS_ALT_KM);
+  g_iss_range_km  = calc_range_km(device_lat, device_lon, latitude, longitude, ISS_ALT_KM);
+  g_iss_elevation = calc_elevation_deg(device_lat, device_lon, latitude, longitude, ISS_ALT_KM);
+  g_iss_fspl_db   = calc_fspl_db(g_iss_range_km, ISS_FREQ_MHZ);
+  g_iss_doppler_hz = calc_doppler_hz(ISS_FREQ_MHZ, g_iss_range_km, iss_range_prev, dt);
+  g_iss_azimuth = calc_azimuth_deg(device_lat, device_lon, latitude, longitude);
+  update_pass_state(g_iss_elevation, g_iss_prev_elev, g_iss_pass_state, sizeof(g_iss_pass_state));
+  g_iss_prev_elev = g_iss_elevation;
+  if (have_css_prev_sample) {
+    float css_dt = (float)(unix_time - css_prev_unix_time);
+    if(css_dt <= 0) css_dt = dt;
+    float css_range_prev = calc_range_km(device_lat, device_lon, css_prev_latitude, css_prev_longitude, CSS_ALT_KM);
+    g_css_range_km  = calc_range_km(device_lat, device_lon, css_latitude, css_longitude, CSS_ALT_KM);
+    g_css_elevation = calc_elevation_deg(device_lat, device_lon, css_latitude, css_longitude, CSS_ALT_KM);
+    g_css_fspl_db   = calc_fspl_db(g_css_range_km, CSS_FREQ_MHZ);
+    g_css_doppler_hz = calc_doppler_hz(CSS_FREQ_MHZ, g_css_range_km, css_range_prev, css_dt);
+    g_css_azimuth = calc_azimuth_deg(device_lat, device_lon, css_latitude, css_longitude);
+    update_pass_state(g_css_elevation, g_css_prev_elev, g_css_pass_state, sizeof(g_css_pass_state));
+    g_css_prev_elev = g_css_elevation;
+  }
+}
+
+void calc_tx_recommendation(float elevation, const char* pass_state, float fspl_db, float kp, const char** text_out, uint32_t* color_out) {
+  if (elevation < 0.0f) { *text_out = "NO CONTACT"; *color_out = 0xFF4444; }
+  else if (kp >= 6.0f) { *text_out = "STORM - POOR"; *color_out = 0xFF8800; }
+  else if (strcmp(pass_state, "SETTING") == 0) { *text_out = "FINISH SOON"; *color_out = 0xFFAA00; }
+  else if (strcmp(pass_state, "PEAK") == 0 && fspl_db < 135.0f) { *text_out = "OPTIMAL WINDOW"; *color_out = 0x00FF88; }
+  else if (strcmp(pass_state, "RISING") == 0) { *text_out = "TRANSMIT NOW"; *color_out = 0x00FF88; }
+  else { *text_out = "IN RANGE"; *color_out = 0x88FF88; }
+}
+
+void refresh_telecom_panel() {
+  if (!device_loc_known) {
+    lv_label_set_text(telecom_label, "Tap UTC time first to\ndetermine your location.");
+    if (g_iss_tx_label) { lv_label_set_text(g_iss_tx_label, "---"); lv_obj_set_style_text_color(g_iss_tx_label, lv_color_hex(0x888888), 0); }
+    if (g_css_tx_label) { lv_label_set_text(g_css_tx_label, "---"); lv_obj_set_style_text_color(g_css_tx_label, lv_color_hex(0x888888), 0); }
+    return;
+  }
+  if (!have_prev_sample) {
+    lv_label_set_text(telecom_label, "Gathering data...\nPlease wait ~20 seconds.");
+    if (g_iss_tx_label) { lv_label_set_text(g_iss_tx_label, "---"); lv_obj_set_style_text_color(g_iss_tx_label, lv_color_hex(0x888888), 0); }
+    if (g_css_tx_label) { lv_label_set_text(g_css_tx_label, "---"); lv_obj_set_style_text_color(g_css_tx_label, lv_color_hex(0x888888), 0); }
+    return;
+  }
+  update_compass_needle_pos(g_iss_compass_ring, g_iss_compass_needle, g_iss_needle_head, g_iss_needle_pts, g_iss_azimuth, g_iss_elevation, true);
+  update_compass_needle_pos(g_css_compass_ring, g_css_compass_needle, g_css_needle_head, g_css_needle_pts, g_css_azimuth, g_css_elevation, false);
+  char ant_buf[128];
+  snprintf(ant_buf, sizeof(ant_buf), "Az: %.0f deg (%s)\nEl: %.1f deg\nStatus: %s", g_iss_azimuth, az_to_cardinal(g_iss_azimuth), g_iss_elevation, g_iss_pass_state);
+  lv_label_set_text(g_iss_ant_label, ant_buf);
+  snprintf(ant_buf, sizeof(ant_buf), "Az: %.0f deg (%s)\nEl: %.1f deg\nStatus: %s", g_css_azimuth, az_to_cardinal(g_css_azimuth), g_css_elevation, g_css_pass_state);
+  lv_label_set_text(g_css_ant_label, ant_buf);
+  const char* tx_text; uint32_t tx_color;
+  calc_tx_recommendation(g_iss_elevation, g_iss_pass_state, g_iss_fspl_db, g_kp_index, &tx_text, &tx_color);
+  lv_label_set_text(g_iss_tx_label, tx_text); lv_obj_set_style_text_color(g_iss_tx_label, lv_color_hex(tx_color), 0);
+  calc_tx_recommendation(g_css_elevation, g_css_pass_state, g_css_fspl_db, g_kp_index, &tx_text, &tx_color);
+  lv_label_set_text(g_css_tx_label, tx_text); lv_obj_set_style_text_color(g_css_tx_label, lv_color_hex(tx_color), 0);
+  char buf[1024]; int off = 0;
+  const char* iss_dir = (g_iss_doppler_hz > 50) ? "Approaching" : (g_iss_doppler_hz < -50) ? "Receding" : "Overhead";
+  const char* css_dir = (g_css_doppler_hz > 50) ? "Approaching" : (g_css_doppler_hz < -50) ? "Receding" : "Overhead";
+  off += snprintf(buf+off, sizeof(buf)-off,
+    "[DOPPLER SHIFT]\n"
+    "ISS  %.3f MHz\n  Shift: %+.1f Hz  %s\n"
+    "CSS  %.3f MHz\n  Shift: %+.1f Hz  %s\n\n",
+    ISS_FREQ_MHZ, g_iss_doppler_hz, iss_dir, CSS_FREQ_MHZ, g_css_doppler_hz, css_dir);
+  off += snprintf(buf+off, sizeof(buf)-off,
+    "[LINK BUDGET]\n"
+    "ISS -> Range: %.0f km\n  FSPL: %.1f dB | %s [%s]\n"
+    "CSS -> Range: %.0f km\n  FSPL: %.1f dB | %s [%s]\n",
+    g_iss_range_km, g_iss_fspl_db, signal_quality(g_iss_fspl_db), signal_bars(g_iss_fspl_db),
+    g_css_range_km, g_css_fspl_db, signal_quality(g_css_fspl_db), signal_bars(g_css_fspl_db));
+  off += snprintf(buf+off, sizeof(buf)-off,
+    "\n[ENVIRONMENT]\n"
+    "Space Weather: %s (Kp:%.1f)\n"
+    "Est. TEC:  %.1f TECU | Delay: +%.1f ns\n",
+    g_space_weather_status, g_kp_index, g_tec_value, g_iono_delay_ns);
+  lv_label_set_text(telecom_label, buf);
+}
+
+void close_telecom_panel_cb(lv_event_t * e) { lv_obj_add_flag(telecom_panel, LV_OBJ_FLAG_HIDDEN); }
+void telecom_btn_cb(lv_event_t * e) {
+  lv_obj_add_flag(predict_panel,  LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(overpass_panel, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(filter_menu,    LV_OBJ_FLAG_HIDDEN);
+  filter_menu_open = false;
+  update_telecom_values(); refresh_telecom_panel();
+  lv_obj_clear_flag(telecom_panel, LV_OBJ_FLAG_HIDDEN);
+}
+
+void draw_map(void) { lv_obj_t * img0 = lv_image_create(lv_screen_active()); lv_image_set_src(img0, &bluemarble_320x240); lv_obj_align(img0, LV_ALIGN_CENTER, 0, 0); }
+
+void init_track_dots() {
+  for (int i = 0; i < MAX_TRACK_DOTS; ++i) {
+    track_dots[i] = lv_obj_create(lv_scr_act()); lv_obj_add_flag(track_dots[i], LV_OBJ_FLAG_HIDDEN); lv_obj_set_size(track_dots[i], 4, 4); lv_obj_set_style_radius(track_dots[i], LV_RADIUS_CIRCLE, 0); lv_obj_set_style_bg_color(track_dots[i], lv_color_hex(0xFF0000), 0); lv_obj_set_style_border_width(track_dots[i], 0, 0); lv_obj_set_style_opa(track_dots[i], LV_OPA_COVER, 0); track_dot_place_time[i] = 0;
+    css_track_dots[i] = lv_obj_create(lv_scr_act()); lv_obj_add_flag(css_track_dots[i], LV_OBJ_FLAG_HIDDEN); lv_obj_set_size(css_track_dots[i], 4, 4); lv_obj_set_style_radius(css_track_dots[i], LV_RADIUS_CIRCLE, 0); lv_obj_set_style_bg_color(css_track_dots[i], lv_color_hex(0x00FF00), 0); lv_obj_set_style_border_width(css_track_dots[i], 0, 0); lv_obj_set_style_opa(css_track_dots[i], LV_OPA_COVER, 0); css_track_dot_place_time[i] = 0;
+  }
+}
+
+void init_predict_dots() {
+  for (int i = 0; i < PREDICT_COUNT; i++) {
+    iss_pred_dots[i] = lv_obj_create(lv_scr_act()); lv_obj_add_flag(iss_pred_dots[i], LV_OBJ_FLAG_HIDDEN); lv_obj_set_size(iss_pred_dots[i], 7, 7); lv_obj_set_style_radius(iss_pred_dots[i], LV_RADIUS_CIRCLE, 0); lv_obj_set_style_bg_opa(iss_pred_dots[i], LV_OPA_TRANSP, 0); lv_obj_set_style_border_color(iss_pred_dots[i], lv_color_hex(0xFF0000), 0); lv_obj_set_style_border_width(iss_pred_dots[i], 2, 0); lv_obj_set_style_opa(iss_pred_dots[i], LV_OPA_TRANSP, 0); iss_pred_opa[i] = 0;
+    css_pred_dots[i] = lv_obj_create(lv_scr_act()); lv_obj_add_flag(css_pred_dots[i], LV_OBJ_FLAG_HIDDEN); lv_obj_set_size(css_pred_dots[i], 7, 7); lv_obj_set_style_radius(css_pred_dots[i], LV_RADIUS_CIRCLE, 0); lv_obj_set_style_bg_opa(css_pred_dots[i], LV_OPA_TRANSP, 0); lv_obj_set_style_border_color(css_pred_dots[i], lv_color_hex(0x00FF00), 0); lv_obj_set_style_border_width(css_pred_dots[i], 2, 0); lv_obj_set_style_opa(css_pred_dots[i], LV_OPA_TRANSP, 0); css_pred_opa[i] = 0;
+  }
+}
+
+void apply_pred_dot_positions() {
+  bool show_iss = (g_sat_filter == 0 || g_sat_filter == 1);
+  bool show_css = (g_sat_filter == 0 || g_sat_filter == 2);
+  for (int i = 0; i < PREDICT_COUNT; i++) {
+    int px = (int)calculate_mercator_x(staged_iss_pred[i].lon, map_width);
+    int py = (int)calculate_mercator_y(staged_iss_pred[i].lat, map_height, map_width);
+    lv_obj_set_pos(iss_pred_dots[i], px - 3, py - 3);
+    if (show_iss) lv_obj_clear_flag(iss_pred_dots[i], LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(iss_pred_dots[i], LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_opa(iss_pred_dots[i], 0, 0); iss_pred_opa[i] = 0;
+    px = (int)calculate_mercator_x(staged_css_pred[i].lon, map_width);
+    py = (int)calculate_mercator_y(staged_css_pred[i].lat, map_height, map_width);
+    lv_obj_set_pos(css_pred_dots[i], px - 3, py - 3);
+    if (show_css) lv_obj_clear_flag(css_pred_dots[i], LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(css_pred_dots[i], LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_opa(css_pred_dots[i], 0, 0); css_pred_opa[i] = 0;
+  }
+}
+
+void update_icons_position() {
+  lat_lon_to_pixel();
+  lv_obj_set_pos(img1, x_pixel - 30, y_pixel - 24);
+  lv_obj_set_pos(img_css, css_x_pixel - 30, css_y_pixel - 24);
+}
+
+void printDataToDisplay() {
+  lv_label_set_text_fmt(lat_label, "Lat: %.2f", latitude);
+  lv_label_set_text_fmt(lon_label, "Lon: %.2f", longitude);
+  lv_label_set_text(country_label, country_name.c_str());
+  lv_label_set_text_fmt(css_lat_label, "Lat: %.2f", css_latitude);
+  lv_label_set_text_fmt(css_lon_label, "Lon: %.2f", css_longitude);
+  lv_label_set_text(css_country_label, css_country_name.c_str());
+  DateTime dt(unix_time);
+  lv_label_set_text_fmt(time_label, "UTC: %02d:%02d:%02d", dt.hour(), dt.minute(), dt.second());
+}
+
+void add_track_points() {
+  bool show_iss = (g_sat_filter == 0 || g_sat_filter == 1);
+  bool show_css = (g_sat_filter == 0 || g_sat_filter == 2);
+  if (track_counter > 14) {
+    lv_obj_set_pos(track_dots[track_dot_counter], x_pixel, y_pixel);
+    if (show_iss) lv_obj_clear_flag(track_dots[track_dot_counter], LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(track_dots[track_dot_counter], LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_opa(track_dots[track_dot_counter], LV_OPA_COVER, 0);
+    track_dot_place_time[track_dot_counter] = millis();
+    track_counter = 0; track_dot_counter = (track_dot_counter + 1) % MAX_TRACK_DOTS;
+  } track_counter++;
+  if (css_track_counter > 14) {
+    lv_obj_set_pos(css_track_dots[css_track_dot_counter], css_x_pixel, css_y_pixel);
+    if (show_css) lv_obj_clear_flag(css_track_dots[css_track_dot_counter], LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(css_track_dots[css_track_dot_counter], LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_opa(css_track_dots[css_track_dot_counter], LV_OPA_COVER, 0);
+    css_track_dot_place_time[css_track_dot_counter] = millis();
+    css_track_counter = 0; css_track_dot_counter = (css_track_dot_counter + 1) % MAX_TRACK_DOTS;
+  } css_track_counter++;
+}
+
+void update_track_dot_fade() {
+  unsigned long now = millis();
+  for (int i = 0; i < MAX_TRACK_DOTS; i++) {
+    if (!lv_obj_has_flag(track_dots[i], LV_OBJ_FLAG_HIDDEN)) {
+      unsigned long age = now - track_dot_place_time[i];
+      int opa = (age >= TRACK_DOT_FADE_MS) ? 0 : (int)(255UL - (255UL * age) / TRACK_DOT_FADE_MS);
+      lv_obj_set_style_opa(track_dots[i], (lv_opa_t)opa, 0);
+    }
+    if (!lv_obj_has_flag(css_track_dots[i], LV_OBJ_FLAG_HIDDEN)) {
+      unsigned long age = now - css_track_dot_place_time[i];
+      int opa = (age >= TRACK_DOT_FADE_MS) ? 0 : (int)(255UL - (255UL * age) / TRACK_DOT_FADE_MS);
+      lv_obj_set_style_opa(css_track_dots[i], (lv_opa_t)opa, 0);
+    }
+  }
+}
+
+// =====================================================================
+// satellitesUpdateTask
+// =====================================================================
+void satellitesUpdateTask(void * param) {
+  esp_task_wdt_add(NULL);
+  for (;;) {
+    esp_task_wdt_reset();
+    if (WiFi.status() == WL_CONNECTED) {
+      g_kp_fetch_counter++;
+      if (g_kp_fetch_counter >= KP_FETCH_INTERVAL_CYCLES || g_kp_fetch_counter == 1) {
+        g_kp_fetch_counter = 0;
+        fetch_kp_index();
+      }
+      esp_task_wdt_reset(); vTaskDelay(pdMS_TO_TICKS(100));
+      if (xSemaphoreTake(g_http_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        WiFiClientSecure client; client.setInsecure(); client.setTimeout(4000);
+        HTTPClient http; http.setTimeout(4000);
+        if (http.begin(client, "https://api.wheretheiss.at/v1/satellites/25544")) {
+          if (http.GET() > 0) {
+            DynamicJsonDocument doc(1024);
+            if (!deserializeJson(doc, http.getString())) {
+              staged_latitude  = doc["latitude"];
+              staged_longitude = doc["longitude"];
+              staged_unix_time = doc["timestamp"].as<unsigned long>();
+            }
+          }
+          http.end();
+        }
+        xSemaphoreGive(g_http_mutex);
+      }
+      esp_task_wdt_reset(); vTaskDelay(pdMS_TO_TICKS(100));
+      {
+        String c = get_country_name_from_coords(staged_latitude, staged_longitude);
+        strncpy(staged_country_name, c.c_str(), sizeof(staged_country_name) - 1);
+        staged_country_name[sizeof(staged_country_name) - 1] = '\0';
+      }
+      esp_task_wdt_reset(); vTaskDelay(pdMS_TO_TICKS(100));
+      if (xSemaphoreTake(g_http_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        WiFiClientSecure client; client.setInsecure(); client.setTimeout(4000);
+        HTTPClient http; http.setTimeout(4000);
+        String n2yo_url = String("https://api.n2yo.com/rest/v1/satellite/positions/") + CSS_NORAD_ID + "/0/0/0/1/&apiKey=" + N2YO_API_KEY;
+        if (http.begin(client, n2yo_url)) {
+          if (http.GET() > 0) {
+            DynamicJsonDocument doc(2048);
+            if (!deserializeJson(doc, http.getString())) {
+              JsonArray positions = doc["positions"];
+              if (positions.size() > 0) {
+                staged_css_latitude  = positions[0]["satlatitude"];
+                staged_css_longitude = positions[0]["satlongitude"];
+                if (doc["info"].containsKey("timestamp")) {
+                  staged_css_unix_time = doc["info"]["timestamp"].as<unsigned long>();
+                }
+              }
+            }
+          }
+          http.end();
+        }
+        xSemaphoreGive(g_http_mutex);
+      }
+      esp_task_wdt_reset(); vTaskDelay(pdMS_TO_TICKS(100));
+      {
+        String c = get_country_name_from_coords(staged_css_latitude, staged_css_longitude);
+        strncpy(staged_css_country_name, c.c_str(), sizeof(staged_css_country_name) - 1);
+        staged_css_country_name[sizeof(staged_css_country_name) - 1] = '\0';
+      }
+      esp_task_wdt_reset();
+      iss_data_ready = true;
+    }
+    vTaskDelay(pdMS_TO_TICKS(POSITION_UPDATE_TIME));
+  }
+}
+
+void compute_predictions_for(bool is_iss, PredictedPoint* out) {
+  bool t_have = is_iss ? have_prev_sample : have_css_prev_sample;
+  if (!t_have) return;
+  float t_lat   = is_iss ? latitude          : css_latitude;
+  float t_lon   = is_iss ? longitude         : css_longitude;
+  float t_plat  = is_iss ? prev_latitude     : css_prev_latitude;
+  float t_plon  = is_iss ? prev_longitude    : css_prev_longitude;
+  unsigned long t_ptime = is_iss ? prev_unix_time : css_prev_unix_time;
+  double lat1 = degrees_to_radians(t_plat), lon1 = degrees_to_radians(t_plon);
+  double lat2 = degrees_to_radians(t_lat),  lon2 = degrees_to_radians(t_lon);
+  double dt_base = (double)((long)unix_time - (long)t_ptime);
+  if (dt_base <= 0) return;
+  double dlat = lat2 - lat1, dlon = lon2 - lon1;
+  double a = sin(dlat/2)*sin(dlat/2) + cos(lat1)*cos(lat2)*sin(dlon/2)*sin(dlon/2);
+  double ang_dist = 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
+  double bearing  = atan2(sin(dlon)*cos(lat2), cos(lat1)*sin(lat2) - sin(lat1)*cos(lat2)*cos(dlon));
+  double ang_spd  = ang_dist / dt_base;
+  const double EARTH_ROT = (2.0 * PI) / 86164.0905;
+  for (int i = 0; i < PREDICT_COUNT; i++) {
+    double ft   = (double)((i + 1) * PREDICT_STEP_SEC);
+    double d    = ang_spd * ft;
+    double lat3 = asin(sin(lat2)*cos(d) + cos(lat2)*sin(d)*cos(bearing));
+    double lon3 = lon2 + atan2(sin(bearing)*sin(d)*cos(lat2), cos(d) - sin(lat2)*sin(lat3));
+    lon3 -= EARTH_ROT * ft;
+    double lon3d = lon3 * 180.0 / PI;
+    while (lon3d >  180.0) lon3d -= 360.0;
+    while (lon3d < -180.0) lon3d += 360.0;
+    out[i].lat = (float)(lat3 * 180.0 / PI);
+    out[i].lon = (float)lon3d;
+    out[i].t   = (unsigned long)unix_time + (unsigned long)ft;
+  }
+}
+
+void cache_predicted_countries(PredictedPoint* pts, char cache[][48], volatile bool* ready_flag) {
+  for (int i = 0; i < PREDICT_COUNT; i++) {
+    String c = get_country_name_from_coords(pts[i].lat, pts[i].lon, 12000UL);
+    strncpy(cache[i], c.c_str(), 47); cache[i][47] = '\0';
+    vTaskDelay(pdMS_TO_TICKS(250));
+  } *ready_flag = true;
+}
+
+void predictPathDotTask(void * param) {
+  while (!have_prev_sample && !have_css_prev_sample) vTaskDelay(pdMS_TO_TICKS(1000));
+  for (;;) {
+    if (have_prev_sample) { compute_predictions_for(true, staged_iss_pred); cache_predicted_countries(staged_iss_pred, iss_pred_country_cache, &iss_pred_country_ready); }
+    if (have_css_prev_sample) { compute_predictions_for(false, staged_css_pred); cache_predicted_countries(staged_css_pred, css_pred_country_cache, &css_pred_country_ready); }
+    if (have_prev_sample || have_css_prev_sample) pred_dots_data_ready = true;
+    vTaskDelay(pdMS_TO_TICKS(PRED_DOT_UPDATE_MS));
+  }
+}
+
+void close_predict_panel_cb(lv_event_t * e) { lv_obj_add_flag(predict_panel, LV_OBJ_FLAG_HIDDEN); }
+void close_overpass_panel_cb(lv_event_t * e) { g_cancel_overpass = true; lv_obj_add_flag(overpass_panel, LV_OBJ_FLAG_HIDDEN); }
+
+void show_cached_prediction_panel(bool is_iss) {
+  bool ready = is_iss ? iss_pred_country_ready : css_pred_country_ready;
+  if (!ready) { lv_label_set_text(predict_label, "Still gathering data...\nTry again in a moment"); return; }
+  PredictedPoint* pts = is_iss ? staged_iss_pred : staged_css_pred;
+  char (*cache)[48]   = is_iss ? iss_pred_country_cache : css_pred_country_cache;
+  String out = is_iss ? "[ISS Path]\n" : "[CSS Path]\n";
+  for (int i = 0; i < PREDICT_COUNT; i++) {
+    DateTime dt(pts[i].t); int mins = (i + 1) * (PREDICT_STEP_SEC / 60);
+    char line[80]; snprintf(line, sizeof(line), "%d) %s - %02d:%02d (+%dm)\n", i + 1, cache[i], dt.hour(), dt.minute(), mins);
+    out += line;
+  }
+  lv_label_set_text(predict_label, out.c_str());
+}
+
+void iss_country_clicked_cb(lv_event_t * event) {
+  g_cancel_overpass = true; lv_obj_add_flag(overpass_panel, LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(filter_menu, LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(telecom_panel, LV_OBJ_FLAG_HIDDEN);
+  filter_menu_open = false; lv_obj_clear_flag(predict_panel, LV_OBJ_FLAG_HIDDEN);
+  if (!have_prev_sample) { lv_label_set_text(predict_label, "Still gathering data...\nTry again later"); return; }
+  show_cached_prediction_panel(true);
+}
+
+void css_country_clicked_cb(lv_event_t * event) {
+  g_cancel_overpass = true; lv_obj_add_flag(overpass_panel, LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(filter_menu, LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(telecom_panel, LV_OBJ_FLAG_HIDDEN);
+  filter_menu_open = false; lv_obj_clear_flag(predict_panel, LV_OBJ_FLAG_HIDDEN);
+  if (!have_css_prev_sample) { lv_label_set_text(predict_label, "Still gathering data...\nTry again later"); return; }
+  show_cached_prediction_panel(false);
+}
+
+void iss_icon_clicked_cb(lv_event_t * event) { lv_label_set_text(fact_label, iss_facts[random(4)]); lv_obj_set_style_text_color(fact_label, lv_color_hex(0xFF0000), 0); fact_opacity = 255; lv_obj_set_style_opa(fact_label, fact_opacity, 0); }
+void css_icon_clicked_cb(lv_event_t * event) { lv_label_set_text(fact_label, css_facts[random(4)]); lv_obj_set_style_text_color(fact_label, lv_color_hex(0x00FF00), 0); fact_opacity = 255; lv_obj_set_style_opa(fact_label, fact_opacity, 0); }
+
+// =====================================================================
+// Local Pass Prediction — لا N2YO ولا Open-Notify ولا SSL
+// =====================================================================
+
+// نفس منطق compute_predictions_for بس بترجع نقطة واحدة بدل array
+static void sat_pos_at(bool is_iss, unsigned long t_future,
+                       float& out_lat, float& out_lon) {
+  float  cur_lat = is_iss ? latitude       : css_latitude;
+  float  cur_lon = is_iss ? longitude      : css_longitude;
+  float  prv_lat = is_iss ? prev_latitude  : css_prev_latitude;
+  float  prv_lon = is_iss ? prev_longitude : css_prev_longitude;
+  unsigned long prv_t = is_iss ? prev_unix_time : css_prev_unix_time;
+
+  double lat1 = degrees_to_radians(prv_lat), lon1 = degrees_to_radians(prv_lon);
+  double lat2 = degrees_to_radians(cur_lat), lon2 = degrees_to_radians(cur_lon);
+
+  double dt0 = (double)((long)unix_time - (long)prv_t);
+  if (dt0 < 1.0) { out_lat = cur_lat; out_lon = cur_lon; return; }
+
+  double dlat = lat2 - lat1, dlon = lon2 - lon1;
+  double a  = sin(dlat/2)*sin(dlat/2)
+            + cos(lat1)*cos(lat2)*sin(dlon/2)*sin(dlon/2);
+  double ad = 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
+  double br = atan2(sin(dlon)*cos(lat2),
+                    cos(lat1)*sin(lat2) - sin(lat1)*cos(lat2)*cos(dlon));
+  double spd = ad / dt0;
+  double ft  = (double)((long)t_future - (long)unix_time);
+  double d   = spd * ft;
+
+  double lat3 = asin(sin(lat2)*cos(d) + cos(lat2)*sin(d)*cos(br));
+  double lon3 = lon2 + atan2(sin(br)*sin(d)*cos(lat2),
+                              cos(d) - sin(lat2)*sin(lat3));
+
+  // تصحيح دوران الأرض
+  lon3 -= (2.0 * PI / 86164.0905) * ft;
+
+  double lon3d = lon3 * 180.0 / PI;
+  while (lon3d >  180.0) lon3d -= 360.0;
+  while (lon3d < -180.0) lon3d += 360.0;
+
+  out_lat = (float)(lat3 * 180.0 / PI);
+  out_lon = (float)lon3d;
+}
+
+// يمشي 24 ساعة قدام بخطوات 30 ثانية ويلاقي التمريرات
+static int find_passes_local(bool is_iss, float obs_lat, float obs_lon,
+                             LocalPass* out, int max_out) {
+  const float ALT_KM   = is_iss ? ISS_ALT_KM : CSS_ALT_KM;
+  const int   STEP_S   = 30;
+  const float MIN_ELEV = 5.0f;       // تجاهل تمريرات أقل من 5 درجة
+  const unsigned long WINDOW = 86400UL;
+
+  int   found   = 0;
+  bool  in_pass = false;
+  float peak_el = -999.0f;
+  unsigned long rise_t = 0, peak_t = 0;
+
+  for (unsigned long t = unix_time;
+       t < unix_time + WINDOW && found < max_out;
+       t += STEP_S) {
+
+    float slat, slon;
+    sat_pos_at(is_iss, t, slat, slon);
+    float el = calc_elevation_deg(obs_lat, obs_lon, slat, slon, ALT_KM);
+
+    if (!in_pass && el >= MIN_ELEV) {
+      in_pass = true; rise_t = t; peak_el = el; peak_t = t;
+    } else if (in_pass && el >= MIN_ELEV) {
+      if (el > peak_el) { peak_el = el; peak_t = t; }
+    } else if (in_pass && el < MIN_ELEV) {
+      in_pass = false;
+      out[found].rise_utc     = rise_t;
+      out[found].peak_utc     = peak_t;
+      out[found].max_el_deg   = peak_el;
+      out[found].duration_min = max(1, (int)((t - rise_t) / 60));
+      found++;
+      peak_el = -999.0f;
+    }
+  }
+  return found;
+}
+
+static void format_passes_local(const char* sat_name, bool is_iss,
+                                float obs_lat, float obs_lon, int& off) {
+  off += snprintf(overpass_result + off, sizeof(overpass_result) - off,
+                  "-- %s Passes --\n", sat_name);
+
+  LocalPass passes[MAX_PASSES_SHOWN];
+  int n = find_passes_local(is_iss, obs_lat, obs_lon, passes, MAX_PASSES_SHOWN);
+
+  if (n == 0) {
+    off += snprintf(overpass_result + off, sizeof(overpass_result) - off,
+                    "  None visible in 24h\n\n");
+    return;
+  }
+  for (int i = 0; i < n; i++) {
+    DateTime dt(passes[i].rise_utc);
+    long diff = max(0L, (long)passes[i].rise_utc - (long)unix_time);
+    char ts_str[20];
+    if (diff < 3600) snprintf(ts_str, sizeof(ts_str), "+%ld min", diff / 60);
+    else             snprintf(ts_str, sizeof(ts_str), "+%.1fh",   diff / 3600.0f);
+
+    off += snprintf(overpass_result + off, sizeof(overpass_result) - off,
+                    "%d) %s  %02d:%02d UTC\n"
+                    "   Max: %.0f deg | %d min\n\n",
+                    i + 1, ts_str, dt.hour(), dt.minute(),
+                    passes[i].max_el_deg, passes[i].duration_min);
+  }
+}
+
+// =====================================================================
+// overpassFetchTask — HTTP call واحدة بس (location)، باقيه كله local
+// =====================================================================
+void overpassFetchTask(void* param) {
+  int off = 0;
+  overpass_result[0] = '\0';
+
+  // الـ location لازمة مرة واحدة بس وبعدين بتتخزن
+  if (!device_loc_known && WiFi.status() == WL_CONNECTED) {
+    if (xSemaphoreTake(g_http_mutex, pdMS_TO_TICKS(6000)) == pdTRUE) {
+      WiFiClient plain;
+      HTTPClient http;
+      plain.setTimeout(4000);
+      http.setTimeout(4000);
+      if (http.begin(plain, "http://ip-api.com/json")) {
+        if (http.GET() == 200) {
+          DynamicJsonDocument doc(512);
+          if (!deserializeJson(doc, http.getString())) {
+            device_lat = doc["lat"].as<float>();
+            device_lon = doc["lon"].as<float>();
+            snprintf(device_city, sizeof(device_city), "%s, %s",
+                     doc["city"].as<String>().c_str(),
+                     doc["country"].as<String>().c_str());
+            device_loc_known = true;
+          }
+        }
+        http.end();
+      }
+      xSemaphoreGive(g_http_mutex);
+    }
+  }
+
+  if (g_cancel_overpass) goto end_task;
+
+  if (!device_loc_known) {
+    strncpy(overpass_result,
+            "Could not get location.\nCheck WiFi & tap time again.",
+            sizeof(overpass_result) - 1);
+    overpass_fetch_done = true;
+    goto end_task;
+  }
+
+  if (!have_prev_sample && !have_css_prev_sample) {
+    strncpy(overpass_result,
+            "Waiting for satellite data.\nTry again in 30 seconds.",
+            sizeof(overpass_result) - 1);
+    overpass_fetch_done = true;
+    goto end_task;
+  }
+
+  // كل ده بيحصل على الـ ESP32 نفسه، مش HTTP
+  off += snprintf(overpass_result + off, sizeof(overpass_result) - off,
+                  "Location: %s\n(%.2f, %.2f)\n\n",
+                  device_city, device_lat, device_lon);
+
+  if (have_prev_sample)
+    format_passes_local("ISS", true, device_lat, device_lon, off);
+
+  if (g_cancel_overpass) goto end_task;
+
+  if (have_css_prev_sample)
+    format_passes_local("Tiangong", false, device_lat, device_lon, off);
+
+  overpass_result[sizeof(overpass_result) - 1] = '\0';
+  if (!g_cancel_overpass) overpass_fetch_done = true;
+
+end_task:
+  overpassTaskHandle = NULL;
+  vTaskDelete(NULL);
+}
+
+// =====================================================================
+// UI Callbacks
+// =====================================================================
+void time_label_clicked_cb(lv_event_t * event) {
+  lv_obj_add_flag(predict_panel,  LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(filter_menu, LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(telecom_panel, LV_OBJ_FLAG_HIDDEN);
+  filter_menu_open = false; lv_obj_clear_flag(overpass_panel, LV_OBJ_FLAG_HIDDEN); lv_obj_scroll_to_y(ov_scroll_area, 0, LV_ANIM_OFF);
+  if (overpassTaskHandle == NULL) {
+    g_cancel_overpass = false; overpass_fetch_done = false;
+    lv_label_set_text(overpass_label,
+      device_loc_known
+        ? "Calculating passes...\nReady in a moment."
+        : "Finding your location...\nReady in a moment.");
+    xTaskCreatePinnedToCore(overpassFetchTask, "OvPassTask", 20480, NULL, 1, &overpassTaskHandle, 0);
+  }
+}
+
+void touchscreen_read(lv_indev_t *indev, lv_indev_data_t *data) {
+  if (touchscreen.tirqTouched() && touchscreen.touched()) {
+    touch_release_counter = 0; TS_Point p = touchscreen.getPoint();
+    x = constrain(map(p.x, 200, 3700, SCREEN_WIDTH, 0), 0, SCREEN_WIDTH - 1);
+    y = constrain(map(p.y, 240, 3800, SCREEN_HEIGHT, 0), 0, SCREEN_HEIGHT - 1);
+    data->state = LV_INDEV_STATE_PRESSED; data->point.x = x; data->point.y = y;
+    if (brightness != 255) { brightness = 255; ledcWrite(LCD_BACKLIGHT_PIN, brightness); }
+  } else {
+    if (++touch_release_counter >= TOUCH_RELEASE_DEBOUNCE) data->state = LV_INDEV_STATE_RELEASED;
+    else { data->state = LV_INDEV_STATE_PRESSED; data->point.x = x; data->point.y = y; }
+  }
+}
+
+void show_splash_screen() {
+  lv_obj_clean(lv_scr_act());
+  lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, 0);
+
+  lv_obj_t * wait_label = lv_label_create(lv_screen_active());
+  lv_label_set_text(wait_label, "Connecting to WiFi...\nPlease wait.");
+  lv_obj_set_style_text_color(wait_label, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_style_text_align(wait_label, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(wait_label, LV_ALIGN_CENTER, 0, 0);
+
+  // رندر فعلي للرسالة على الشاشة قبل ما WiFiManager.autoConnect()
+  // يحجز المعالج بالكامل (هي دالة blocking)
+  for (int i = 0; i < 6; i++) { lv_timer_handler(); lv_tick_inc(5); delay(5); }
+}
+
+void setup() {
+  Serial.begin(115200); g_http_mutex = xSemaphoreCreateMutex();
+  TFT_eSPI tft = TFT_eSPI(); tft.init(); tft.setRotation(1);
+  ledcAttach(LCD_BACKLIGHT_PIN, freq, resolution); ledcWrite(LCD_BACKLIGHT_PIN, brightness);
+  lv_init(); lv_log_register_print_cb(log_print);
+  touchscreenSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS); touchscreen.begin(touchscreenSPI); touchscreen.setRotation(1);
+  lv_display_t * disp = lv_tft_espi_create(SCREEN_WIDTH, SCREEN_HEIGHT, draw_buf, sizeof(draw_buf));
+  lv_indev_t * indev = lv_indev_create(); lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER); lv_indev_set_read_cb(indev, touchscreen_read);
+
+  show_splash_screen();
+
+WiFiManager wifiManager; wifiManager.autoConnect(DEFAULT_CAPTIVE_SSID);
+
+// امسح أي touch بايظ حصل وقت الـ WiFi
+while (touchscreen.tirqTouched()) { touchscreen.getPoint(); delay(1); }
+touch_release_counter = TOUCH_RELEASE_DEBOUNCE;
+  esp_task_wdt_deinit(); esp_task_wdt_config_t twdt_cfg = { .timeout_ms = 60000, .idle_core_mask = 0, .trigger_panic = true }; esp_task_wdt_init(&twdt_cfg);
+
+  lv_obj_clean(lv_scr_act()); lv_obj_clear_flag(lv_scr_act(), LV_OBJ_FLAG_SCROLLABLE);
+  draw_map(); init_track_dots(); init_predict_dots();
+
+  img1 = lv_image_create(lv_screen_active()); lv_image_set_src(img1, &iss_icon_trans60x60); lv_obj_add_flag(img1, LV_OBJ_FLAG_CLICKABLE); lv_obj_add_event_cb(img1, iss_icon_clicked_cb, LV_EVENT_CLICKED, NULL);
+  img_css = lv_image_create(lv_screen_active()); lv_image_set_src(img_css, &iss_icon_trans60x60); lv_obj_set_style_image_recolor(img_css, lv_color_hex(0x00FF00), 0); lv_obj_set_style_image_recolor_opa(img_css, 180, 0); lv_obj_add_flag(img_css, LV_OBJ_FLAG_CLICKABLE); lv_obj_add_event_cb(img_css, css_icon_clicked_cb, LV_EVENT_CLICKED, NULL);
+
+  lat_label = lv_label_create(lv_screen_active()); lon_label = lv_label_create(lv_screen_active()); country_label = lv_label_create(lv_screen_active());
+  css_lat_label = lv_label_create(lv_screen_active()); css_lon_label = lv_label_create(lv_screen_active()); css_country_label = lv_label_create(lv_screen_active());
+  time_label = lv_label_create(lv_screen_active()); fact_label = lv_label_create(lv_screen_active());
+
+  lv_obj_set_style_text_color(lat_label, lv_color_hex(0xFF0000), 0); lv_obj_set_style_text_color(lon_label, lv_color_hex(0xFF0000), 0); lv_obj_set_style_text_color(country_label, lv_color_hex(0xFF0000), 0);
+  lv_obj_set_style_text_color(css_lat_label, lv_color_hex(0x00FF00), 0); lv_obj_set_style_text_color(css_lon_label, lv_color_hex(0x00FF00), 0); lv_obj_set_style_text_color(css_country_label, lv_color_hex(0x00FF00), 0);
+
+  lv_obj_set_style_text_color(time_label, lv_color_hex(0x000000), 0); lv_obj_set_style_bg_color(time_label, lv_color_hex(0xFFFFFF), 0); lv_obj_set_style_bg_opa(time_label, LV_OPA_70, 0); lv_obj_set_style_pad_hor(time_label, 6, 0); lv_obj_set_style_pad_ver(time_label, 3, 0); lv_obj_set_style_radius(time_label, 6, 0); lv_obj_add_flag(time_label, LV_OBJ_FLAG_CLICKABLE); lv_obj_set_ext_click_area(time_label, 8); lv_obj_add_event_cb(time_label, time_label_clicked_cb, LV_EVENT_CLICKED, NULL);
+  lv_obj_add_flag(country_label, LV_OBJ_FLAG_CLICKABLE); lv_obj_set_ext_click_area(country_label, 10); lv_obj_add_event_cb(country_label, iss_country_clicked_cb, LV_EVENT_CLICKED, NULL); lv_obj_set_style_bg_color(country_label, lv_color_hex(0x000000), 0); lv_obj_set_style_bg_opa(country_label, LV_OPA_50, 0); lv_obj_set_style_pad_all(country_label, 3, 0); lv_obj_set_style_radius(country_label, 4, 0);
+  lv_obj_add_flag(css_country_label, LV_OBJ_FLAG_CLICKABLE); lv_obj_set_ext_click_area(css_country_label, 10); lv_obj_add_event_cb(css_country_label, css_country_clicked_cb, LV_EVENT_CLICKED, NULL); lv_obj_set_style_bg_color(css_country_label, lv_color_hex(0x000000), 0); lv_obj_set_style_bg_opa(css_country_label, LV_OPA_50, 0); lv_obj_set_style_pad_all(css_country_label, 3, 0); lv_obj_set_style_radius(css_country_label, 4, 0);
+
+  lv_obj_align(lat_label, LV_ALIGN_TOP_LEFT, 5, 5); lv_obj_align(lon_label, LV_ALIGN_TOP_LEFT, 5, 20); lv_obj_align(country_label, LV_ALIGN_TOP_LEFT, 5, 35);
+  lv_obj_align(css_lat_label, LV_ALIGN_TOP_RIGHT, -5, 5); lv_obj_align(css_lon_label, LV_ALIGN_TOP_RIGHT, -5, 20); lv_obj_align(css_country_label, LV_ALIGN_TOP_RIGHT, -5, 35);
+  lv_obj_align(time_label, LV_ALIGN_TOP_MID, 0, 5); lv_obj_align(fact_label, LV_ALIGN_BOTTOM_MID, 0, -10);
+
+  predict_panel = lv_obj_create(lv_screen_active()); lv_obj_set_size(predict_panel, SCREEN_WIDTH, SCREEN_HEIGHT); lv_obj_set_pos(predict_panel, 0, 0); lv_obj_set_style_radius(predict_panel, 0, 0); lv_obj_set_style_bg_color(predict_panel, lv_color_hex(0x101020), 0); lv_obj_set_style_bg_opa(predict_panel, LV_OPA_COVER, 0); lv_obj_clear_flag(predict_panel, LV_OBJ_FLAG_SCROLLABLE); lv_obj_add_flag(predict_panel, LV_OBJ_FLAG_HIDDEN); lv_obj_add_event_cb(predict_panel, close_predict_panel_cb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t * predict_title = lv_label_create(predict_panel); lv_label_set_text(predict_title, "Path Prediction"); lv_obj_set_style_text_color(predict_title, lv_color_hex(0xFFFFFF), 0); lv_obj_align(predict_title, LV_ALIGN_TOP_MID, 0, 8);
+  predict_label = lv_label_create(predict_panel); lv_obj_set_width(predict_label, SCREEN_WIDTH - 20); lv_label_set_long_mode(predict_label, LV_LABEL_LONG_WRAP); lv_label_set_text(predict_label, "Loading..."); lv_obj_set_style_text_color(predict_label, lv_color_hex(0xFFFFFF), 0); lv_obj_align(predict_label, LV_ALIGN_TOP_LEFT, 10, 35);
+  lv_obj_t * predict_close_btn = lv_btn_create(predict_panel); lv_obj_set_size(predict_close_btn, 160, 44); lv_obj_align(predict_close_btn, LV_ALIGN_BOTTOM_MID, 0, -10); lv_obj_set_ext_click_area(predict_close_btn, 15); lv_obj_add_event_cb(predict_close_btn, close_predict_panel_cb, LV_EVENT_CLICKED, NULL); lv_obj_t * predict_close_lbl = lv_label_create(predict_close_btn); lv_label_set_text(predict_close_lbl, "Back"); lv_obj_center(predict_close_lbl);
+
+  overpass_panel = lv_obj_create(lv_screen_active()); lv_obj_set_size(overpass_panel, SCREEN_WIDTH, SCREEN_HEIGHT); lv_obj_set_pos(overpass_panel, 0, 0); lv_obj_set_style_radius(overpass_panel, 0, 0); lv_obj_set_style_bg_color(overpass_panel, lv_color_hex(0x0A1020), 0); lv_obj_set_style_bg_opa(overpass_panel, LV_OPA_COVER, 0); lv_obj_clear_flag(overpass_panel, LV_OBJ_FLAG_SCROLLABLE); lv_obj_add_flag(overpass_panel, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_t * ov_title = lv_label_create(overpass_panel); lv_label_set_text(ov_title, "Satellite Overpasses"); lv_obj_set_style_text_color(ov_title, lv_color_hex(0xFFFFFF), 0); lv_obj_align(ov_title, LV_ALIGN_TOP_MID, 0, 5);
+  ov_scroll_area = lv_obj_create(overpass_panel); lv_obj_set_pos(ov_scroll_area, 0, 25); lv_obj_set_size(ov_scroll_area, SCREEN_WIDTH, 170); lv_obj_set_scroll_dir(ov_scroll_area, LV_DIR_VER); lv_obj_set_scrollbar_mode(ov_scroll_area, LV_SCROLLBAR_MODE_ACTIVE); lv_obj_set_style_bg_opa(ov_scroll_area, LV_OPA_TRANSP, 0); lv_obj_set_style_border_width(ov_scroll_area, 0, 0); lv_obj_set_style_pad_all(ov_scroll_area, 5, 0);
+  overpass_label = lv_label_create(ov_scroll_area); lv_obj_set_width(overpass_label, SCREEN_WIDTH - 16); lv_label_set_long_mode(overpass_label, LV_LABEL_LONG_WRAP); lv_label_set_text(overpass_label, overpass_result); lv_obj_set_style_text_color(overpass_label, lv_color_hex(0xFFFFFF), 0); lv_obj_align(overpass_label, LV_ALIGN_TOP_LEFT, 0, 0);
+  lv_obj_t * ov_close_btn = lv_btn_create(overpass_panel); lv_obj_set_size(ov_close_btn, 160, 38); lv_obj_align(ov_close_btn, LV_ALIGN_BOTTOM_MID, 0, -4); lv_obj_set_ext_click_area(ov_close_btn, 12); lv_obj_add_event_cb(ov_close_btn, close_overpass_panel_cb, LV_EVENT_CLICKED, NULL); lv_obj_t * ov_close_lbl = lv_label_create(ov_close_btn); lv_label_set_text(ov_close_lbl, "Back"); lv_obj_center(ov_close_lbl);
+
+  filter_btn = lv_btn_create(lv_screen_active()); lv_obj_set_size(filter_btn, 36, 36); lv_obj_align(filter_btn, LV_ALIGN_BOTTOM_RIGHT, -5, -5); lv_obj_set_style_radius(filter_btn, 6, 0); lv_obj_set_style_bg_color(filter_btn, lv_color_hex(0x222244), 0); lv_obj_set_style_bg_opa(filter_btn, LV_OPA_80, 0); lv_obj_set_style_border_color(filter_btn, lv_color_hex(0x6666BB), 0); lv_obj_set_style_border_width(filter_btn, 1, 0); lv_obj_set_ext_click_area(filter_btn, 8); lv_obj_add_event_cb(filter_btn, filter_btn_cb, LV_EVENT_CLICKED, NULL); lv_obj_t * filter_btn_lbl = lv_label_create(filter_btn); lv_label_set_text(filter_btn_lbl, LV_SYMBOL_LIST); lv_obj_set_style_text_color(filter_btn_lbl, lv_color_hex(0xCCCCFF), 0); lv_obj_center(filter_btn_lbl);
+  filter_menu = lv_obj_create(lv_screen_active()); lv_obj_set_size(filter_menu, 130, 126); lv_obj_align(filter_menu, LV_ALIGN_RIGHT_MID, -5, 0); lv_obj_set_style_bg_color(filter_menu, lv_color_hex(0x101030), 0); lv_obj_set_style_bg_opa(filter_menu, LV_OPA_COVER, 0); lv_obj_set_style_border_color(filter_menu, lv_color_hex(0x4444AA), 0); lv_obj_set_style_border_width(filter_menu, 1, 0); lv_obj_set_style_radius(filter_menu, 8, 0); lv_obj_set_style_pad_all(filter_menu, 6, 0); lv_obj_clear_flag(filter_menu, LV_OBJ_FLAG_SCROLLABLE); lv_obj_add_flag(filter_menu, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_t * fmenu_title = lv_label_create(filter_menu); lv_label_set_text(fmenu_title, "Show:"); lv_obj_set_style_text_color(fmenu_title, lv_color_hex(0xAAAACC), 0); lv_obj_align(fmenu_title, LV_ALIGN_TOP_MID, 0, 0);
+  lv_obj_t * btn_iss = lv_btn_create(filter_menu); lv_obj_set_size(btn_iss, 112, 30); lv_obj_align(btn_iss, LV_ALIGN_TOP_MID, 0, 18); lv_obj_set_style_bg_color(btn_iss, lv_color_hex(0x440000), 0); lv_obj_set_style_border_color(btn_iss, lv_color_hex(0xFF4444), 0); lv_obj_set_style_border_width(btn_iss, 1, 0); lv_obj_set_style_radius(btn_iss, 5, 0); lv_obj_add_event_cb(btn_iss, filter_iss_cb, LV_EVENT_CLICKED, NULL); lv_obj_t * lbl_iss = lv_label_create(btn_iss); lv_label_set_text(lbl_iss, "ISS Only"); lv_obj_set_style_text_color(lbl_iss, lv_color_hex(0xFF6666), 0); lv_obj_center(lbl_iss);
+  lv_obj_t * btn_css = lv_btn_create(filter_menu); lv_obj_set_size(btn_css, 112, 30); lv_obj_align(btn_css, LV_ALIGN_TOP_MID, 0, 54); lv_obj_set_style_bg_color(btn_css, lv_color_hex(0x004400), 0); lv_obj_set_style_border_color(btn_css, lv_color_hex(0x44FF44), 0); lv_obj_set_style_border_width(btn_css, 1, 0); lv_obj_set_style_radius(btn_css, 5, 0); lv_obj_add_event_cb(btn_css, filter_css_cb, LV_EVENT_CLICKED, NULL); lv_obj_t * lbl_css = lv_label_create(btn_css); lv_label_set_text(lbl_css, "CSS Only"); lv_obj_set_style_text_color(lbl_css, lv_color_hex(0x66FF66), 0); lv_obj_center(lbl_css);
+  lv_obj_t * btn_both = lv_btn_create(filter_menu); lv_obj_set_size(btn_both, 112, 30); lv_obj_align(btn_both, LV_ALIGN_TOP_MID, 0, 90); lv_obj_set_style_bg_color(btn_both, lv_color_hex(0x222244), 0); lv_obj_set_style_border_color(btn_both, lv_color_hex(0x8888CC), 0); lv_obj_set_style_border_width(btn_both, 1, 0); lv_obj_set_style_radius(btn_both, 5, 0); lv_obj_add_event_cb(btn_both, filter_both_cb, LV_EVENT_CLICKED, NULL); lv_obj_t * lbl_both = lv_label_create(btn_both); lv_label_set_text(lbl_both, "Both"); lv_obj_set_style_text_color(lbl_both, lv_color_hex(0xCCCCFF), 0); lv_obj_center(lbl_both);
+
+  telecom_btn = lv_btn_create(lv_screen_active()); lv_obj_set_size(telecom_btn, 36, 36); lv_obj_align(telecom_btn, LV_ALIGN_BOTTOM_LEFT, 5, -5); lv_obj_set_style_radius(telecom_btn, 6, 0); lv_obj_set_style_bg_color(telecom_btn, lv_color_hex(0x224422), 0); lv_obj_set_style_bg_opa(telecom_btn, LV_OPA_80, 0); lv_obj_set_style_border_color(telecom_btn, lv_color_hex(0x44BB44), 0); lv_obj_set_style_border_width(telecom_btn, 1, 0); lv_obj_set_ext_click_area(telecom_btn, 8); lv_obj_add_event_cb(telecom_btn, telecom_btn_cb, LV_EVENT_CLICKED, NULL); lv_obj_t * telecom_btn_lbl = lv_label_create(telecom_btn); lv_label_set_text(telecom_btn_lbl, LV_SYMBOL_WIFI); lv_obj_set_style_text_color(telecom_btn_lbl, lv_color_hex(0xAAFFAA), 0); lv_obj_center(telecom_btn_lbl);
+  telecom_panel = lv_obj_create(lv_screen_active()); lv_obj_set_size(telecom_panel, SCREEN_WIDTH, SCREEN_HEIGHT); lv_obj_set_pos(telecom_panel, 0, 0); lv_obj_set_style_radius(telecom_panel, 0, 0); lv_obj_set_style_bg_color(telecom_panel, lv_color_hex(0x0A1A0A), 0); lv_obj_set_style_bg_opa(telecom_panel, LV_OPA_COVER, 0); lv_obj_clear_flag(telecom_panel, LV_OBJ_FLAG_SCROLLABLE); lv_obj_add_flag(telecom_panel, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_t * telecom_title = lv_label_create(telecom_panel); lv_label_set_text(telecom_title, "Telecom & Pointing Analysis"); lv_obj_set_style_text_color(telecom_title, lv_color_hex(0x88FF88), 0); lv_obj_align(telecom_title, LV_ALIGN_TOP_MID, 0, 5);
+  lv_obj_t * telecom_scroll_area = lv_obj_create(telecom_panel); lv_obj_set_pos(telecom_scroll_area, 0, 25); lv_obj_set_size(telecom_scroll_area, SCREEN_WIDTH, 175); lv_obj_set_scroll_dir(telecom_scroll_area, LV_DIR_VER); lv_obj_set_scrollbar_mode(telecom_scroll_area, LV_SCROLLBAR_MODE_ACTIVE); lv_obj_set_style_bg_opa(telecom_scroll_area, LV_OPA_TRANSP, 0); lv_obj_set_style_border_width(telecom_scroll_area, 0, 0); lv_obj_set_style_pad_all(telecom_scroll_area, 0, 0); lv_obj_set_style_pad_bottom(telecom_scroll_area, 20, 0);
+
+  lv_obj_t * iss_sect_lbl = lv_label_create(telecom_scroll_area); lv_label_set_text(iss_sect_lbl, "ISS ANTENNA"); lv_obj_set_style_text_color(iss_sect_lbl, lv_color_hex(0xFF7777), 0); lv_obj_set_pos(iss_sect_lbl, 25, 5);
+  g_iss_compass_ring = lv_obj_create(telecom_scroll_area); lv_obj_set_size(g_iss_compass_ring, 80, 80); lv_obj_set_pos(g_iss_compass_ring, 20, 25); lv_obj_set_style_radius(g_iss_compass_ring, LV_RADIUS_CIRCLE, 0); lv_obj_set_style_bg_color(g_iss_compass_ring, lv_color_hex(0x1A0808), 0); lv_obj_set_style_bg_opa(g_iss_compass_ring, LV_OPA_COVER, 0); lv_obj_set_style_border_color(g_iss_compass_ring, lv_color_hex(0xFF5555), 0); lv_obj_set_style_border_width(g_iss_compass_ring, 2, 0); lv_obj_clear_flag(g_iss_compass_ring, LV_OBJ_FLAG_SCROLLABLE);lv_obj_set_style_pad_all(g_iss_compass_ring, 0, 0);lv_obj_t *iss_pin = lv_obj_create(g_iss_compass_ring);
+  lv_obj_set_size(iss_pin, 6, 6); 
+  lv_obj_align(iss_pin, LV_ALIGN_CENTER, 0, 0); 
+  lv_obj_set_style_radius(iss_pin, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(iss_pin, lv_color_white(), 0); 
+  lv_obj_set_style_border_width(iss_pin, 0, 0);
+  lv_obj_t* i_n = lv_label_create(g_iss_compass_ring); lv_label_set_text(i_n, "N"); lv_obj_set_style_text_color(i_n, lv_color_hex(0xAAAAAA), 0); lv_obj_align(i_n, LV_ALIGN_TOP_MID, 0, -5); lv_obj_t* i_s = lv_label_create(g_iss_compass_ring); lv_label_set_text(i_s, "S"); lv_obj_set_style_text_color(i_s, lv_color_hex(0xAAAAAA), 0); lv_obj_align(i_s, LV_ALIGN_BOTTOM_MID, 0, 5); lv_obj_t* i_e = lv_label_create(g_iss_compass_ring); lv_label_set_text(i_e, "E"); lv_obj_set_style_text_color(i_e, lv_color_hex(0xAAAAAA), 0); lv_obj_align(i_e, LV_ALIGN_RIGHT_MID, 5, 0); lv_obj_t* i_w = lv_label_create(g_iss_compass_ring); lv_label_set_text(i_w, "W"); lv_obj_set_style_text_color(i_w, lv_color_hex(0xAAAAAA), 0); lv_obj_align(i_w, LV_ALIGN_LEFT_MID, -5, 0);
+  g_iss_compass_needle = lv_line_create(g_iss_compass_ring); lv_obj_set_style_line_color(g_iss_compass_needle, lv_color_hex(0xFF8844), 0); lv_obj_set_style_line_width(g_iss_compass_needle, 3, 0); lv_obj_set_style_line_rounded(g_iss_compass_needle, true, 0); lv_obj_set_size(g_iss_compass_needle, 80, 80); lv_obj_set_pos(g_iss_compass_needle, 0, 0);
+  g_iss_needle_head = lv_label_create(g_iss_compass_ring); lv_label_set_text(g_iss_needle_head, "▲"); lv_obj_set_style_text_color(g_iss_needle_head, lv_color_hex(0xFF8844), 0);
+  g_iss_ant_label = lv_label_create(telecom_scroll_area); lv_obj_set_pos(g_iss_ant_label, 15, 115); lv_obj_set_width(g_iss_ant_label, 150); lv_label_set_long_mode(g_iss_ant_label, LV_LABEL_LONG_WRAP); lv_obj_set_style_text_color(g_iss_ant_label, lv_color_hex(0xFFDDDD), 0); lv_label_set_text(g_iss_ant_label, "Az: ---\nStatus: N/A");
+  g_iss_tx_label = lv_label_create(telecom_scroll_area); lv_obj_set_pos(g_iss_tx_label, 15, 172); lv_obj_set_width(g_iss_tx_label, 130); lv_label_set_long_mode(g_iss_tx_label, LV_LABEL_LONG_WRAP); lv_obj_set_style_text_color(g_iss_tx_label, lv_color_hex(0x888888), 0); lv_label_set_text(g_iss_tx_label, "---");
+
+  lv_obj_t * css_sect_lbl = lv_label_create(telecom_scroll_area); lv_label_set_text(css_sect_lbl, "CSS ANTENNA"); lv_obj_set_style_text_color(css_sect_lbl, lv_color_hex(0x77FF77), 0); lv_obj_set_pos(css_sect_lbl, 185, 5);
+  g_css_compass_ring = lv_obj_create(telecom_scroll_area); lv_obj_set_size(g_css_compass_ring, 80, 80); lv_obj_set_pos(g_css_compass_ring, 180, 25); lv_obj_set_style_radius(g_css_compass_ring, LV_RADIUS_CIRCLE, 0); lv_obj_set_style_bg_color(g_css_compass_ring, lv_color_hex(0x081808), 0); lv_obj_set_style_bg_opa(g_css_compass_ring, LV_OPA_COVER, 0); lv_obj_set_style_border_color(g_css_compass_ring, lv_color_hex(0x55FF55), 0); lv_obj_set_style_border_width(g_css_compass_ring, 2, 0); lv_obj_clear_flag(g_css_compass_ring, LV_OBJ_FLAG_SCROLLABLE);lv_obj_set_style_pad_all(g_css_compass_ring, 0, 0);lv_obj_t *css_pin = lv_obj_create(g_css_compass_ring);
+  lv_obj_set_size(css_pin, 6, 6); 
+  lv_obj_align(css_pin, LV_ALIGN_CENTER, 0, 0); 
+  lv_obj_set_style_radius(css_pin, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(css_pin, lv_color_white(), 0); 
+  lv_obj_set_style_border_width(css_pin, 0, 0);
+  lv_obj_t* c_n = lv_label_create(g_css_compass_ring); lv_label_set_text(c_n, "N"); lv_obj_set_style_text_color(c_n, lv_color_hex(0xAAAAAA), 0); lv_obj_align(c_n, LV_ALIGN_TOP_MID, 0, -5); lv_obj_t* c_s = lv_label_create(g_css_compass_ring); lv_label_set_text(c_s, "S"); lv_obj_set_style_text_color(c_s, lv_color_hex(0xAAAAAA), 0); lv_obj_align(c_s, LV_ALIGN_BOTTOM_MID, 0, 5); lv_obj_t* c_e = lv_label_create(g_css_compass_ring); lv_label_set_text(c_e, "E"); lv_obj_set_style_text_color(c_e, lv_color_hex(0xAAAAAA), 0); lv_obj_align(c_e, LV_ALIGN_RIGHT_MID, 5, 0); lv_obj_t* c_w = lv_label_create(g_css_compass_ring); lv_label_set_text(c_w, "W"); lv_obj_set_style_text_color(c_w, lv_color_hex(0xAAAAAA), 0); lv_obj_align(c_w, LV_ALIGN_LEFT_MID, -5, 0);
+  g_css_compass_needle = lv_line_create(g_css_compass_ring); lv_obj_set_style_line_color(g_css_compass_needle, lv_color_hex(0x44FF88), 0); lv_obj_set_style_line_width(g_css_compass_needle, 3, 0); lv_obj_set_style_line_rounded(g_css_compass_needle, true, 0); lv_obj_set_size(g_css_compass_needle, 80, 80); lv_obj_set_pos(g_css_compass_needle, 0, 0);
+  g_css_needle_head = lv_label_create(g_css_compass_ring); lv_label_set_text(g_css_needle_head, "▲"); lv_obj_set_style_text_color(g_css_needle_head, lv_color_hex(0x44FF88), 0);
+  g_css_ant_label = lv_label_create(telecom_scroll_area); lv_obj_set_pos(g_css_ant_label, 175, 115); lv_obj_set_width(g_css_ant_label, 135); lv_label_set_long_mode(g_css_ant_label, LV_LABEL_LONG_WRAP); lv_obj_set_style_text_color(g_css_ant_label, lv_color_hex(0xDDFFDD), 0); lv_label_set_text(g_css_ant_label, "Az: ---\nStatus: N/A");
+  g_css_tx_label = lv_label_create(telecom_scroll_area); lv_obj_set_pos(g_css_tx_label, 175, 172); lv_obj_set_width(g_css_tx_label, 130); lv_label_set_long_mode(g_css_tx_label, LV_LABEL_LONG_WRAP); lv_obj_set_style_text_color(g_css_tx_label, lv_color_hex(0x888888), 0); lv_label_set_text(g_css_tx_label, "---");
+
+  lv_obj_t * separator = lv_line_create(telecom_scroll_area); static lv_point_precise_t sep_pts[] = {{10, 200}, {310, 200}}; lv_line_set_points(separator, sep_pts, 2); lv_obj_set_style_line_color(separator, lv_color_hex(0x445544), 0);
+  telecom_label = lv_label_create(telecom_scroll_area); lv_obj_set_pos(telecom_label, 10, 210); lv_obj_set_width(telecom_label, SCREEN_WIDTH - 20); lv_label_set_long_mode(telecom_label, LV_LABEL_LONG_WRAP); lv_obj_set_style_text_color(telecom_label, lv_color_hex(0xCCFFCC), 0); lv_label_set_text(telecom_label, "Loading...");
+  lv_obj_t * telecom_close_btn = lv_btn_create(telecom_panel); lv_obj_set_size(telecom_close_btn, 160, 36); lv_obj_align(telecom_close_btn, LV_ALIGN_BOTTOM_MID, 0, -2); lv_obj_set_ext_click_area(telecom_close_btn, 15); lv_obj_add_event_cb(telecom_close_btn, close_telecom_panel_cb, LV_EVENT_CLICKED, NULL); lv_obj_t * telecom_close_lbl = lv_label_create(telecom_close_btn); lv_label_set_text(telecom_close_lbl, "Back"); lv_obj_center(telecom_close_lbl);
+
+  xTaskCreatePinnedToCore(predictPathDotTask, "PredDotTask", 16384, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(satellitesUpdateTask, "SatTask", 12288, NULL, 1, &issTaskHandle, 0);
+}
+
+void loop() {
+  lv_timer_handler();
+  static uint32_t last_brightness = millis(), last_fact = millis(), last_pred_fade_tick = millis(), last_track_fade_tick = millis();
+
+  if (iss_data_ready) {
+    iss_data_ready = false;
+    if (unix_time != 0 && staged_unix_time != unix_time) {
+      prev_latitude = latitude; prev_longitude = longitude;
+      prev_unix_time = unix_time; have_prev_sample = true;
+      css_prev_latitude = css_latitude; css_prev_longitude = css_longitude;
+      css_prev_unix_time = (staged_css_unix_time != 0) ? staged_css_unix_time : unix_time;
+      have_css_prev_sample = true;
+    }
+    latitude = staged_latitude; longitude = staged_longitude;
+    unix_time = staged_unix_time; country_name = String(staged_country_name);
+    css_latitude = staged_css_latitude; css_longitude = staged_css_longitude;
+    css_country_name = String(staged_css_country_name);
+    update_icons_position(); printDataToDisplay(); add_track_points(); update_telecom_values();
+    if (!lv_obj_has_flag(telecom_panel, LV_OBJ_FLAG_HIDDEN)) refresh_telecom_panel();
+  }
+
+  if (pred_dots_data_ready) { pred_dots_data_ready = false; pred_fade_state = 1; }
+  if (millis() - last_pred_fade_tick >= 15) {
+    last_pred_fade_tick = millis();
+    if (pred_fade_state == 1) {
+      bool all_zero = true;
+      for (int i = 0; i < PREDICT_COUNT; i++) {
+        if (iss_pred_opa[i] > 0) { iss_pred_opa[i] = (uint8_t)max(0, (int)iss_pred_opa[i] - 15); lv_obj_set_style_opa(iss_pred_dots[i], iss_pred_opa[i], 0); if (iss_pred_opa[i] > 0) all_zero = false; }
+        if (css_pred_opa[i] > 0) { css_pred_opa[i] = (uint8_t)max(0, (int)css_pred_opa[i] - 15); lv_obj_set_style_opa(css_pred_dots[i], css_pred_opa[i], 0); if (css_pred_opa[i] > 0) all_zero = false; }
+      }
+      if (all_zero) { apply_pred_dot_positions(); pred_fade_state = 2; }
+    } else if (pred_fade_state == 2) {
+      bool all_done = true;
+      for (int i = 0; i < PREDICT_COUNT; i++) {
+        bool show_iss = (g_sat_filter == 0 || g_sat_filter == 1);
+        if (show_iss && iss_pred_opa[i] < PRED_SETTLED_OPA[i]) { iss_pred_opa[i] = (uint8_t)min((int)PRED_SETTLED_OPA[i], (int)iss_pred_opa[i] + 15); lv_obj_set_style_opa(iss_pred_dots[i], iss_pred_opa[i], 0); if (iss_pred_opa[i] < PRED_SETTLED_OPA[i]) all_done = false; }
+        bool show_css = (g_sat_filter == 0 || g_sat_filter == 2);
+        if (show_css && css_pred_opa[i] < PRED_SETTLED_OPA[i]) { css_pred_opa[i] = (uint8_t)min((int)PRED_SETTLED_OPA[i], (int)css_pred_opa[i] + 15); lv_obj_set_style_opa(css_pred_dots[i], css_pred_opa[i], 0); if (css_pred_opa[i] < PRED_SETTLED_OPA[i]) all_done = false; }
+      }
+      if (all_done) pred_fade_state = 0;
+    }
+  }
+
+  if (millis() - last_brightness >= BRIGHTNESS_UPDATE_TIME) { if (brightness > SCREEN_MINIMUM_BRIGHTNESS) brightness -= 10; ledcWrite(LCD_BACKLIGHT_PIN, brightness); last_brightness = millis(); }
+  if (millis() - last_fact >= FACT_FADE_UPDATE_TIME) { if (fact_opacity > 0) { fact_opacity--; lv_obj_set_style_opa(fact_label, fact_opacity, 0); } last_fact = millis(); }
+  if (millis() - last_track_fade_tick >= 500) { update_track_dot_fade(); last_track_fade_tick = millis(); }
+  if (overpass_fetch_done) { overpass_fetch_done = false; lv_label_set_text(overpass_label, overpass_result); lv_obj_scroll_to_y(ov_scroll_area, 0, LV_ANIM_OFF); }
+
+  lv_tick_inc(5); delay(5);
+}
