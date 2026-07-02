@@ -22,7 +22,10 @@ import { PredictionPanel } from "@/components/PredictionPanel";
 import { HistoryDashboard } from "@/components/HistoryDashboard";
 import { NextPassBadge } from "@/components/NextPassBadge";
 import { computePredictions } from "@/lib/satmath";
-import { Globe, Map, Radio, Clock, Navigation, Filter, Satellite } from "lucide-react";
+import {
+  Globe, Map, Radio, Clock, Navigation, Filter, Satellite,
+  ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Menu, X,
+} from "lucide-react";
 
 interface TrailPoint { lat: number; lon: number; ts: number }
 
@@ -55,10 +58,10 @@ export default function Home() {
   const [toast, setToast] = useState<{ msg: string; color: string } | null>(null);
   const [issTrail, setIssTrail] = useState<TrailPoint[]>([]);
   const [cssTrail, setCssTrail] = useState<TrailPoint[]>([]);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [isMobile, setIsMobile] = useState(false);
 
-  // ── correct prev-position tracking via refs ──────────────────────────────
-  // lastIssRef = the most-recent ISS snapshot we have already stored
-  // prevIss    = the snapshot BEFORE the current one (for velocity calcs)
   const lastIssRef = useRef<SatellitePosition | undefined>(undefined);
   const lastCssRef = useRef<SatellitePosition | undefined>(undefined);
   const [prevIss, setPrevIss] = useState<SatellitePosition | undefined>(undefined);
@@ -66,6 +69,18 @@ export default function Home() {
 
   const pollCount = useRef(0);
   const queryClient = useQueryClient();
+
+  useEffect(() => {
+    const check = () => {
+      const mobile = window.innerWidth < 768;
+      setIsMobile(mobile);
+      if (mobile) setSidebarOpen(false);
+      else setSidebarOpen(true);
+    };
+    check();
+    window.addEventListener("resize", check);
+    return () => window.removeEventListener("resize", check);
+  }, []);
 
   const { data: iss, isLoading: issLoading } = useGetIssPosition({
     query: { refetchInterval: 10000, queryKey: getGetIssPositionQueryKey() },
@@ -81,18 +96,15 @@ export default function Home() {
   });
   const addHistory = useAddHistoryRecord();
 
-  // ── ISS position tracking ─────────────────────────────────────────────────
   useEffect(() => {
     if (!iss) return;
     setIssTrail(prev => [...prev, { lat: iss.latitude, lon: iss.longitude, ts: iss.timestamp }].slice(-60));
     if (lastIssRef.current && lastIssRef.current.timestamp !== iss.timestamp) {
-      // A genuinely new position arrived — old current becomes prev
       setPrevIss(lastIssRef.current);
     }
     lastIssRef.current = iss;
   }, [iss?.timestamp]);
 
-  // ── CSS position tracking ─────────────────────────────────────────────────
   useEffect(() => {
     if (!css) return;
     setCssTrail(prev => [...prev, { lat: css.latitude, lon: css.longitude, ts: css.timestamp }].slice(-60));
@@ -102,7 +114,6 @@ export default function Home() {
     lastCssRef.current = css;
   }, [css?.timestamp]);
 
-  // ── auto-save to history every 10 polls (~100 s) ──────────────────────────
   useEffect(() => {
     if (!iss && !css) return;
     pollCount.current += 1;
@@ -121,7 +132,6 @@ export default function Home() {
     }
   }, [iss?.timestamp, css?.timestamp]);
 
-  // ── derived predictions (need at least 2 distinct snapshots) ─────────────
   const issPredictions = (iss && prevIss && prevIss.timestamp !== iss.timestamp)
     ? computePredictions(iss.latitude, iss.longitude, prevIss.latitude, prevIss.longitude, iss.timestamp, prevIss.timestamp)
     : [];
@@ -138,7 +148,6 @@ export default function Home() {
     setActivePanel(prev => prev === panel ? "none" : panel);
   }
 
-  // UTC clock (updates on each poll; good enough, no setInterval needed)
   const utcNow = new Date();
   const utcStr = `${String(utcNow.getUTCHours()).padStart(2, "0")}:${String(utcNow.getUTCMinutes()).padStart(2, "0")}:${String(utcNow.getUTCSeconds()).padStart(2, "0")} UTC`;
 
@@ -149,137 +158,182 @@ export default function Home() {
   return (
     <div className="flex flex-col h-screen overflow-hidden" style={{ background: "#0a0e1a" }}>
       {/* ── Header ─────────────────────────────────────────────────────────── */}
-      <header className="flex items-center gap-4 px-4 py-2 border-b shrink-0" style={{ background: "#0d1020", borderColor: "#1e2a3e" }}>
-        <div className="flex items-center gap-2">
-          <Satellite className="w-5 h-5 text-green-400" />
-          <span className="font-mono font-bold text-white text-sm tracking-widest">SATELLITE TRACKER</span>
+      <header className="flex items-center gap-2 px-3 py-2 border-b shrink-0" style={{ background: "#0d1020", borderColor: "#1e2a3e" }}>
+        {/* Sidebar toggle (always visible) */}
+        <button
+          onClick={() => setSidebarOpen(p => !p)}
+          className="p-1.5 rounded transition-colors shrink-0"
+          style={{ color: sidebarOpen ? "#44FF44" : "#555", border: "1px solid #1e2a3e" }}
+          title={sidebarOpen ? "Hide panel" : "Show panel"}
+        >
+          {sidebarOpen ? <X className="w-4 h-4" /> : <Menu className="w-4 h-4" />}
+        </button>
+
+        <div className="flex items-center gap-1.5 shrink-0">
+          <Satellite className="w-4 h-4 text-green-400" />
+          <span className="font-mono font-bold text-white text-xs tracking-widest">SATELLITE TRACKER</span>
         </div>
-        <div className="ml-auto font-mono text-xs text-gray-400">{utcStr}</div>
-        {weather && (
-          <div className="font-mono text-xs" style={{ color: weather.kpIndex >= 6 ? "#FF4444" : weather.kpIndex >= 4 ? "#FF8800" : "#44FF44" }}>
-            Kp: {weather.kpIndex.toFixed(1)} {weather.status}
+
+        <div className="ml-auto flex items-center gap-2 min-w-0">
+          <div className="font-mono text-xs text-gray-400 shrink-0 hidden sm:block">{utcStr}</div>
+          {weather && (
+            <div className="font-mono text-xs shrink-0" style={{ color: weather.kpIndex >= 6 ? "#FF4444" : weather.kpIndex >= 4 ? "#FF8800" : "#44FF44" }}>
+              Kp: {weather.kpIndex.toFixed(1)} <span className="hidden sm:inline">{weather.status}</span>
+            </div>
+          )}
+          {userLocation?.known && (
+            <div className="font-mono text-xs text-gray-500 truncate hidden md:block">{userCity}</div>
+          )}
+          {/* ISS/CSS mini coordinates on mobile header */}
+          <div className="flex gap-2 text-xs font-mono sm:hidden shrink-0">
+            {iss && <span style={{ color: "#FF4444" }}>{iss.latitude.toFixed(1)}°</span>}
+            {css && <span style={{ color: "#44FF44" }}>{css.latitude.toFixed(1)}°</span>}
           </div>
-        )}
-        {userLocation?.known && (
-          <div className="font-mono text-xs text-gray-500 hidden md:block">{userCity}</div>
-        )}
+        </div>
       </header>
 
       {/* ── Body ───────────────────────────────────────────────────────────── */}
-      <div className="flex flex-1 overflow-hidden">
+      <div className="flex flex-1 overflow-hidden relative">
 
-        {/* Left sidebar */}
-        <div className="w-52 shrink-0 flex flex-col gap-2 p-2 border-r overflow-y-auto" style={{ background: "#0d1020", borderColor: "#1e2a3e" }}>
-          {/* ISS card */}
-          <div>
-            <SatelliteCard
-              sat={iss}
-              name="ISS"
-              color="#FF4444"
-              isLoading={issLoading}
-              onClick={() => {
-                showToast(ISS_FACTS[Math.floor(Math.random() * ISS_FACTS.length)], "#FF4444");
-                togglePanel("predict-iss");
-              }}
-            />
-            <div className="px-1">
-              <NextPassBadge sat="iss" current={iss} prev={prevIss} obsLat={userLat} obsLon={userLon} />
-            </div>
-          </div>
+        {/* Mobile backdrop */}
+        {sidebarOpen && isMobile && (
+          <div
+            className="absolute inset-0 bg-black/60 z-30"
+            onClick={() => setSidebarOpen(false)}
+          />
+        )}
 
-          {/* CSS card */}
-          <div>
-            <SatelliteCard
-              sat={css}
-              name="CSS"
-              color="#44FF44"
-              isLoading={cssLoading}
-              onClick={() => {
-                showToast(CSS_FACTS[Math.floor(Math.random() * CSS_FACTS.length)], "#44FF44");
-                togglePanel("predict-css");
-              }}
-            />
-            <div className="px-1">
-              <NextPassBadge sat="css" current={css} prev={prevCss} obsLat={userLat} obsLon={userLon} />
-            </div>
-          </div>
-
-          <div className="mt-auto space-y-1 pt-2">
-            {/* Filter */}
-            <div className="border rounded p-1.5" style={{ borderColor: "#1e2a3e", background: "#0a0e1a" }}>
-              <div className="flex items-center gap-1 mb-1">
-                <Filter className="w-3 h-3 text-gray-500" />
-                <span className="font-mono text-xs text-gray-500">FILTER</span>
-              </div>
-              <div className="flex flex-col gap-0.5">
-                {(["both", "iss", "css"] as SatFilter[]).map(f => (
-                  <button
-                    key={f}
-                    onClick={() => setFilter(f)}
-                    className="text-left text-xs font-mono px-2 py-0.5 rounded transition-all"
-                    style={{
-                      background: filter === f ? (f === "iss" ? "#3a0a0a" : f === "css" ? "#0a2a0a" : "#1a1a2a") : "transparent",
-                      color: filter === f ? (f === "iss" ? "#FF6666" : f === "css" ? "#66FF66" : "#AAAACC") : "#555",
-                      border: `1px solid ${filter === f ? (f === "iss" ? "#FF444433" : f === "css" ? "#44FF4433" : "#6666AA33") : "transparent"}`,
-                    }}
-                    data-testid={`button-filter-${f}`}
-                  >
-                    {f === "both" ? "Both" : f.toUpperCase() + " Only"}
-                  </button>
-                ))}
+        {/* ── Left sidebar ─────────────────────────────────────────────────── */}
+        <div
+          className="flex flex-col gap-2 p-2 border-r overflow-y-auto transition-all duration-300 shrink-0"
+          style={{
+            background: "#0d1020",
+            borderColor: "#1e2a3e",
+            width: sidebarOpen ? (isMobile ? "220px" : "208px") : "0px",
+            padding: sidebarOpen ? undefined : "0px",
+            overflow: sidebarOpen ? "auto" : "hidden",
+            position: isMobile ? "absolute" : "relative",
+            top: 0,
+            left: 0,
+            bottom: 0,
+            zIndex: isMobile ? 40 : "auto",
+            transform: isMobile ? (sidebarOpen ? "translateX(0)" : "translateX(-100%)") : "none",
+          }}
+        >
+          <div style={{ width: isMobile ? "220px" : "192px", minWidth: isMobile ? "220px" : "192px" }}>
+            {/* ISS card */}
+            <div className="mb-2">
+              <SatelliteCard
+                sat={iss}
+                name="ISS"
+                color="#FF4444"
+                isLoading={issLoading}
+                onClick={() => {
+                  showToast(ISS_FACTS[Math.floor(Math.random() * ISS_FACTS.length)], "#FF4444");
+                  togglePanel("predict-iss");
+                  if (isMobile) setSidebarOpen(false);
+                }}
+              />
+              <div className="px-1">
+                <NextPassBadge sat="iss" current={iss} prev={prevIss} obsLat={userLat} obsLon={userLon} />
               </div>
             </div>
 
-            {/* Panel buttons */}
-            <button
-              onClick={() => togglePanel("pass-times")}
-              className="w-full flex items-center gap-1.5 text-xs font-mono px-2 py-1.5 rounded transition-all"
-              style={{
-                background: activePanel === "pass-times" ? "#0a1a2a" : "#0a0e1a",
-                border: `1px solid ${activePanel === "pass-times" ? "#4488FF66" : "#1e2a3e"}`,
-                color: activePanel === "pass-times" ? "#4488FF" : "#888",
-              }}
-              data-testid="button-panel-passes"
-            >
-              <Clock className="w-3 h-3" /> Pass Times
-            </button>
-            <button
-              onClick={() => togglePanel("passes")}
-              className="w-full flex items-center gap-1.5 text-xs font-mono px-2 py-1.5 rounded transition-all"
-              style={{
-                background: activePanel === "passes" ? "#0a1a2a" : "#0a0e1a",
-                border: `1px solid ${activePanel === "passes" ? "#4488FF66" : "#1e2a3e"}`,
-                color: activePanel === "passes" ? "#7799FF" : "#888",
-              }}
-              data-testid="button-panel-overpasses"
-            >
-              <Navigation className="w-3 h-3" /> Overpasses
-            </button>
-            <button
-              onClick={() => togglePanel("telecom")}
-              className="w-full flex items-center gap-1.5 text-xs font-mono px-2 py-1.5 rounded transition-all"
-              style={{
-                background: activePanel === "telecom" ? "#0a1a0a" : "#0a0e1a",
-                border: `1px solid ${activePanel === "telecom" ? "#44FF4466" : "#1e2a3e"}`,
-                color: activePanel === "telecom" ? "#44FF44" : "#888",
-              }}
-              data-testid="button-panel-telecom"
-            >
-              <Radio className="w-3 h-3" /> Telecom
-            </button>
+            {/* CSS card */}
+            <div className="mb-2">
+              <SatelliteCard
+                sat={css}
+                name="CSS"
+                color="#44FF44"
+                isLoading={cssLoading}
+                onClick={() => {
+                  showToast(CSS_FACTS[Math.floor(Math.random() * CSS_FACTS.length)], "#44FF44");
+                  togglePanel("predict-css");
+                  if (isMobile) setSidebarOpen(false);
+                }}
+              />
+              <div className="px-1">
+                <NextPassBadge sat="css" current={css} prev={prevCss} obsLat={userLat} obsLon={userLon} />
+              </div>
+            </div>
+
+            <div className="space-y-1 pt-1">
+              {/* Filter */}
+              <div className="border rounded p-1.5" style={{ borderColor: "#1e2a3e", background: "#0a0e1a" }}>
+                <div className="flex items-center gap-1 mb-1">
+                  <Filter className="w-3 h-3 text-gray-500" />
+                  <span className="font-mono text-xs text-gray-500">FILTER</span>
+                </div>
+                <div className="flex flex-col gap-0.5">
+                  {(["both", "iss", "css"] as SatFilter[]).map(f => (
+                    <button
+                      key={f}
+                      onClick={() => setFilter(f)}
+                      className="text-left text-xs font-mono px-2 py-1 rounded transition-all"
+                      style={{
+                        background: filter === f ? (f === "iss" ? "#3a0a0a" : f === "css" ? "#0a2a0a" : "#1a1a2a") : "transparent",
+                        color: filter === f ? (f === "iss" ? "#FF6666" : f === "css" ? "#66FF66" : "#AAAACC") : "#555",
+                        border: `1px solid ${filter === f ? (f === "iss" ? "#FF444433" : f === "css" ? "#44FF4433" : "#6666AA33") : "transparent"}`,
+                      }}
+                      data-testid={`button-filter-${f}`}
+                    >
+                      {f === "both" ? "Both" : f.toUpperCase() + " Only"}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Panel buttons */}
+              <button
+                onClick={() => { togglePanel("pass-times"); if (isMobile) setSidebarOpen(false); }}
+                className="w-full flex items-center gap-1.5 text-xs font-mono px-2 py-2 rounded transition-all"
+                style={{
+                  background: activePanel === "pass-times" ? "#0a1a2a" : "#0a0e1a",
+                  border: `1px solid ${activePanel === "pass-times" ? "#4488FF66" : "#1e2a3e"}`,
+                  color: activePanel === "pass-times" ? "#4488FF" : "#888",
+                }}
+                data-testid="button-panel-passes"
+              >
+                <Clock className="w-3 h-3" /> Pass Times
+              </button>
+              <button
+                onClick={() => { togglePanel("passes"); if (isMobile) setSidebarOpen(false); }}
+                className="w-full flex items-center gap-1.5 text-xs font-mono px-2 py-2 rounded transition-all"
+                style={{
+                  background: activePanel === "passes" ? "#0a1a2a" : "#0a0e1a",
+                  border: `1px solid ${activePanel === "passes" ? "#4488FF66" : "#1e2a3e"}`,
+                  color: activePanel === "passes" ? "#7799FF" : "#888",
+                }}
+                data-testid="button-panel-overpasses"
+              >
+                <Navigation className="w-3 h-3" /> Overpasses
+              </button>
+              <button
+                onClick={() => { togglePanel("telecom"); if (isMobile) setSidebarOpen(false); }}
+                className="w-full flex items-center gap-1.5 text-xs font-mono px-2 py-2 rounded transition-all"
+                style={{
+                  background: activePanel === "telecom" ? "#0a1a0a" : "#0a0e1a",
+                  border: `1px solid ${activePanel === "telecom" ? "#44FF4466" : "#1e2a3e"}`,
+                  color: activePanel === "telecom" ? "#44FF44" : "#888",
+                }}
+                data-testid="button-panel-telecom"
+              >
+                <Radio className="w-3 h-3" /> Telecom
+              </button>
+            </div>
           </div>
         </div>
 
-        {/* Map + panels column */}
-        <div className="flex-1 flex flex-col overflow-hidden">
+        {/* ── Map + panels column ──────────────────────────────────────────── */}
+        <div className="flex-1 flex flex-col overflow-hidden min-w-0">
           {/* Map mode bar */}
-          <div className="flex items-center gap-2 px-3 py-1.5 border-b shrink-0" style={{ background: "#0d1020", borderColor: "#1e2a3e" }}>
-            <span className="font-mono text-xs text-gray-600">MAP MODE</span>
+          <div className="flex items-center gap-2 px-2 py-1.5 border-b shrink-0 flex-wrap" style={{ background: "#0d1020", borderColor: "#1e2a3e" }}>
+            <span className="font-mono text-xs text-gray-600 hidden sm:block">MAP MODE</span>
             {(["2d", "3d"] as MapMode[]).map(m => (
               <button
                 key={m}
                 onClick={() => setMapMode(m)}
-                className="flex items-center gap-1 text-xs font-mono px-2 py-0.5 rounded transition-all"
+                className="flex items-center gap-1 text-xs font-mono px-2 py-1 rounded transition-all"
                 style={{
                   background: mapMode === m ? "#0a2a0a" : "transparent",
                   border: `1px solid ${mapMode === m ? "#44FF4444" : "#1e2a3e"}`,
@@ -287,12 +341,12 @@ export default function Home() {
                 }}
                 data-testid={`button-map-${m}`}
               >
-                {m === "2d" ? <><Map className="w-3 h-3" /> 2D Map</> : <><Globe className="w-3 h-3" /> 3D Globe</>}
+                {m === "2d" ? <><Map className="w-3 h-3" /> 2D</> : <><Globe className="w-3 h-3" /> 3D</>}
               </button>
             ))}
-            <div className="ml-auto flex items-center gap-3 text-xs font-mono">
-              {iss && <span style={{ color: "#FF4444" }}>ISS {iss.latitude.toFixed(2)}&deg;,{iss.longitude.toFixed(2)}&deg;</span>}
-              {css && <span style={{ color: "#44FF44" }}>CSS {css.latitude.toFixed(2)}&deg;,{css.longitude.toFixed(2)}&deg;</span>}
+            <div className="ml-auto flex items-center gap-2 text-xs font-mono overflow-hidden">
+              {iss && <span className="truncate" style={{ color: "#FF4444" }}>ISS {iss.latitude.toFixed(2)}°,{iss.longitude.toFixed(2)}°</span>}
+              {css && <span className="truncate hidden sm:block" style={{ color: "#44FF44" }}>CSS {css.latitude.toFixed(2)}°,{css.longitude.toFixed(2)}°</span>}
             </div>
           </div>
 
@@ -320,7 +374,7 @@ export default function Home() {
               />
             )}
 
-            {/* ── Overlay panels — z-index 2000 to sit above Leaflet (400-1000) ── */}
+            {/* ── Overlay panels ────────────────────────────────────────────── */}
             {activePanel === "telecom" && (
               <div className="absolute inset-0 overflow-y-auto" style={{ zIndex: 2000 }}>
                 <TelecomPanel
@@ -357,7 +411,6 @@ export default function Home() {
                   </div>
                   <div className="p-3 space-y-3">
                     <p className="text-xs font-mono text-gray-500">Predicted positions (+10 min steps)</p>
-                    {/* ISS predictions */}
                     <div>
                       <h3 className="font-mono text-xs font-bold mb-2 border-b pb-1" style={{ color: "#FF4444", borderColor: "#FF444433" }}>── ISS PATH ──</h3>
                       {issPredictions.length === 0 ? (
@@ -376,7 +429,6 @@ export default function Home() {
                         </div>
                       ))}
                     </div>
-                    {/* CSS predictions */}
                     <div>
                       <h3 className="font-mono text-xs font-bold mb-2 border-b pb-1" style={{ color: "#44FF44", borderColor: "#44FF4433" }}>── CSS (TIANGONG) PATH ──</h3>
                       {cssPredictions.length === 0 ? (
@@ -433,8 +485,27 @@ export default function Home() {
         </div>
       </div>
 
-      {/* History Dashboard */}
-      <HistoryDashboard />
+      {/* ── History Dashboard (collapsible) ─────────────────────────────────── */}
+      <div className="shrink-0 border-t" style={{ borderColor: "#1e2a3e" }}>
+        <button
+          onClick={() => setHistoryOpen(p => !p)}
+          className="w-full flex items-center justify-between px-3 py-1.5 font-mono text-xs transition-colors"
+          style={{ background: "#0a0e1a", color: "#555" }}
+        >
+          <span style={{ color: "#444" }}>POSITION HISTORY</span>
+          <div className="flex items-center gap-3">
+            {!historyOpen && (
+              <span className="text-xs font-mono" style={{ color: "#444" }}>
+                tap to expand
+              </span>
+            )}
+            {historyOpen
+              ? <ChevronDown className="w-3 h-3" style={{ color: "#555" }} />
+              : <ChevronUp className="w-3 h-3" style={{ color: "#555" }} />}
+          </div>
+        </button>
+        {historyOpen && <HistoryDashboard />}
+      </div>
     </div>
   );
 }
